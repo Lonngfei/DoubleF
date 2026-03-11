@@ -1,2 +1,0 @@
-[console_scripts]
-doublef = doublef.cli:main
