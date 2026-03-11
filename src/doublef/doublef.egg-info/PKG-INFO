@@ -1,0 +1,129 @@
+Metadata-Version: 2.4
+Name: doublef
+Version: 0.1.0
+Summary: DoubleF: A fast and flexible phase association and earthquake location method
+Author-email: Longfei Duan <duanlongfei20@mails.ucas.ac.cn>
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: torch
+Requires-Dist: obspy
+
+# DoubleF
+
+**DoubleF** is a fast and flexible algorithm for seismic phase association and earthquake location. It uses an adaptive Sobol sampling strategy to efficiently search the source parameter space. The algorithm initializes a quasi-uniform sample set using a Sobol sequence. At each iteration, the objective function is evaluated, and the search region is refined based on the top-performing samples. This iterative narrowing continues until convergence. The highest-scoring sample is then selected, and associated phases within a residual threshold are included as the optimal event.
+
+![Iterative search process](src/img/plot.png)
+---
+
+## Installation & Environment Setup
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/Lonngfei/DoubleF.git
+cd DoubleF
+````
+
+### 2. Set Up a Conda Environment (Recommended)
+
+```bash
+conda create -n doublef python=3.9
+conda activate doublef
+pip install -r requirements.txt
+```
+
+If you plan to run on **GPU**, make sure your **PyTorch** version matches your **CUDA** version. Use the official guide to select the correct version: [https://pytorch.org/get-started/previous-versions](https://pytorch.org/get-started/previous-versions)
+
+### 3. Confirm CUDA Installation
+
+Run the following in a Python shell:
+
+```python
+import torch
+print(torch.cuda.is_available())
+```
+
+* `True`: CUDA is installed and PyTorch can use your GPU.
+* `False`: Check your NVIDIA driver and CUDA-PyTorch compatibility.
+
+---
+
+## Running & Testing
+
+### 1. Quick Test Run
+
+```bash
+python main.py
+```
+
+### 2. Prepare Input Files
+
+Ensure the following input files are correctly formatted and placed:
+
+```text
+Picks/YYYYMMDD.csv       # Daily pick files
+TravelTime/mymodel.nd    # Velocity model for travel time calculation
+```
+
+### 3. Configuration Guidelines
+
+Although `Config.py` defines many parameters, **most do not require changes**. Pay attention to the following:
+
+####  Velocity Model (`cal_tt`)
+
+* Set `cal_tt: True` when using a new velocity model (only once).
+* Afterward, use `False` to skip travel time recalculation.
+
+####  Sampling Parameters
+
+* Generally do not need to be changed.
+* If nearest station distance > `0.6`, consider increasing sampling.
+
+####  Score Calculating
+
+* You may tune scoring weights (`p_weight` etc.)  if  your needs.
+* `max_distance` is critical; others have smaller impact.
+
+#### Output Options
+
+* Set output directory and output according your need.
+
+####  Other Important Parameters
+
+* `max_batch_size` only affects time consuming (larger = faster, but more memory use).
+
+#### Visual
+
+* Customize visualization options under the `Visual` section for debugging or result analysis.
+
+### 4. Run the Program
+
+```bash
+python main.py
+```
+
+---
+
+## Check Results
+
+The output directory includes:
+
+* Configuration used in the run
+* Phase association report
+* Terminal logs/output
+
+### Phase File Format:
+
+```text
+Year Month Day Hour Minute Second Latitude Longitude Depth Magnitude ErrHorizontal ErrVertical ErrTime RMS NumP NumS NumBoth NumSum ID
+NET Station Distance PhaseTime Probability PhaseType Residual Mag Amplitude
+```
+
+> **Note:** Horizontal, vertical, and time errors do not reflect true location uncertainty. NaN or large values should be treated with caution.
+
+---
+
+## Related Papers
+
+```

@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/doublef.egg-info/PKG-INFO
+src/doublef.egg-info/SOURCES.txt
+src/doublef.egg-info/dependency_links.txt
+src/doublef.egg-info/entry_points.txt
+src/doublef.egg-info/requires.txt
+src/doublef.egg-info/top_level.txt
