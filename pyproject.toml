@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "doublef"
-version = "0.1.1"
+version = "0.1.2"
 description = "DoubleF: A fast and flexible phase association and earthquake location method"
 readme = "README.md"
 requires-python = ">=3.9"
+license={text="MIT"}
 authors = [
     { name = "Longfei Duan", email = "duanlongfei20@mails.ucas.ac.cn" }
 ]
