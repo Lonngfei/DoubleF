@@ -151,8 +151,7 @@ class Sampler(object):
         """
         N, _, num_samples = self.location_matrix_sample.shape
         S, _ = self.station_matrix.shape
-        self.scores = torch.zeros(N, 5, num_samples, dtype=torch.float32).to(self.device)
-        self.scores[:, :4, :] = self.location_matrix_sample
+        score_values = torch.empty(N, num_samples, dtype=torch.float32, device=self.device)
 
         batch_size = min(batch_size, int(self.max_batch_size / N / S))
         
@@ -173,14 +172,17 @@ class Sampler(object):
                       self.number_type, self.time_type, self.magnitude_type, self.dis0, self.dis1, self.device)
 
             batch_scores = s.cal_weight_score()
-            self.scores[:, 4, batch_idx * batch_size: batch_idx * batch_size + batch_size_current] = batch_scores[:, :,
-                                                                                                     4].permute(1, 0)
 
-        # Select top-k samples
-        _, top_k_indices = torch.topk(self.scores[:, 4, :], top_number, dim=1, largest=True, sorted=False)
-        self.top_samples = torch.gather(self.scores, 2, top_k_indices.unsqueeze(1).expand(-1, 5, -1))
-        del self.scores, top_k_indices, batch_scores,  self.location_matrix_sample
-        return self.top_samples
+            score_values[:, batch_idx * batch_size: batch_idx * batch_size + batch_size_current] = batch_scores[:, :, 4].permute(1, 0)
+
+            del s, batch_scores, sample_batch
+
+        top_scores, top_k_indices = torch.topk(score_values, top_number, dim=1, largest=True, sorted=False)
+        top_locations = torch.gather(self.location_matrix_sample,2,top_k_indices.unsqueeze(1).expand(-1, 4, -1)) 
+
+        self.top_samples = torch.cat([top_locations, top_scores.unsqueeze(1)], dim=1)
+
+        del score_values, top_k_indices, top_scores, self.location_matrix_sample
 
     def compute_confidence_interval(self, quantile):
         lower_quantile = (1 - quantile) / 2

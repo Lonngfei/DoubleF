@@ -1,7 +1,11 @@
 
 # DoubleF
-
-**DoubleF** is a fast and flexible algorithm for seismic phase association and earthquake location. It uses an adaptive Sobol sampling strategy to efficiently search the source parameter space. The algorithm initializes a quasi-uniform sample set using a Sobol sequence. At each iteration, the objective function is evaluated, and the search region is refined based on the top-performing samples. This iterative narrowing continues until convergence. The highest-scoring sample is then selected, and associated phases within a residual threshold are included as the optimal event.
+#### A Fast and Flexible Phase Association and Earthquake Location Method Using Adaptive Sobol Sampling
+1. We define a search space over the source parameters and initialize it with a quasi-uniform set of samples generated using a Sobol sequence, which provides an efficient and systematic exploration of high-dimensional parameter spaces with low discrepancy. 
+2. The objective function is evaluated at each sampled point, and the search region is subsequently refined based on the quantile range of the top-value samples.
+3.  This process is implemented iteratively. In each iteration, the search space is progressively narrowed to focus on regions most likely to contain the global optimum. 
+4.  The iteration continues until a predefined convergence criterion is met. 
+5.  Finally, the sample with the highest objective function value is selected, and the phases associated within an acceptable residual threshold are considered the optimal association for the event.
 
 ![Iterative search process](src/doublef/img/plot.png)
 
