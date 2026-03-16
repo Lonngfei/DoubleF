@@ -157,15 +157,3 @@ NET Station Distance PhaseTime Probability PhaseType Residual ML Mag Amplitude
 *  These values describe the spatial dispersion of candidate solutions that are associated with the same nearby location. Specifically, they quantify the statistical deviation (e.g., mean or standard deviation) of these candidate locations relative to the final solution.
 *  If only a single candidate solution exists, the dispersion cannot be computed and the value is reported as **NaN**.
 *  When these values are unusually large or reported as NaN, the corresponding results should be interpreted with caution.
-
-
-## Recommended Citation
-
-If you use DoubleF in your research, please cite the related paper(s).
-
-## Contact
-
-For questions, suggestions, or bug reports, please open an issue on GitHub or contact:
-
-**Longfei Duan**
-Email: [duanlongfei20@mails.ucas.ac.cn](mailto:duanlongfei20@mails.ucas.ac.cn)

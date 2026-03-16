@@ -23,7 +23,7 @@ class CsvTorch(object):
     def generate_station_data(self):
         self.df = pd.read_csv(self.phase_csv)
         self.df["Time"] = pd.to_datetime(self.df["Time"], utc=True)
-        ref_time = pd.Timestamp(year=self.year, month=self.month, day=self.month, tz="UTC")
+        ref_time = pd.Timestamp(year=self.year, month=self.month, day=self.day, tz="UTC")
         self.df["RelativeTime"] = (self.df["Time"] - ref_time).dt.total_seconds()
 
         if len(self.df) == 0:
