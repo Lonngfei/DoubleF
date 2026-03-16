@@ -4,6 +4,7 @@ from pyrocko import cake
 import csv
 import torch
 from scipy.interpolate import griddata
+import os
 
 
 def interpolate_torch_matrix(matrix, block_size=10000, device='cuda'):
@@ -174,10 +175,11 @@ class TravelTime(object):
                                  device=self.device)
         self.p_tt = interpolate_torch_matrix(self.p_tt, device=self.device)
         self.s_tt = interpolate_torch_matrix(self.s_tt, device=self.device)
+        os.remove(self.tt_csv)
         np.save(self.ptt_npy, self.p_tt.cpu().numpy().T)
         np.save(self.stt_npy, self.s_tt.cpu().numpy().T)
 
 if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    tt = TravelTime('TravelTime/original_model.nd', 'TravelTime/original_model.csv', 'TravelTime/p_tt.csv', 'TravelTime/s_tt.csv', device)
+    tt = TravelTime('TravelTime/original_model.nd',  'TravelTime/p_tt.csv', 'TravelTime/s_tt.csv', device)
     tt.run()

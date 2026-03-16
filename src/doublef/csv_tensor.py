@@ -3,11 +3,15 @@ import torch
 import pandas as pd
 
 class CsvTorch(object):
-    def __init__(self, ptt_npy, stt_npy, phase_csv, device):
+    def __init__(self, ptt_npy, stt_npy, phase_csv, device, year=0, month=0, day=0):
         self.ptt_npy = ptt_npy
         self.stt_npy = stt_npy
         self.phase_csv = phase_csv
         self.device = device
+        self.year = year
+        self.month = month
+        self.day = day
+
 
     def load_tt(self):
         p_npy = np.load(self.ptt_npy)
@@ -18,6 +22,10 @@ class CsvTorch(object):
 
     def generate_station_data(self):
         self.df = pd.read_csv(self.phase_csv)
+        self.df["Time"] = pd.to_datetime(self.df["Time"], utc=True)
+        ref_time = pd.Timestamp(year=self.year, month=self.month, day=self.month, tz="UTC")
+        self.df["RelativeTime"] = (self.df["Time"] - ref_time).dt.total_seconds()
+
         if len(self.df) == 0:
             return False
         self.df['net_sta'] = self.df['network'].astype(str) + '_' + self.df['station'].astype(str)

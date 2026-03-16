@@ -172,9 +172,10 @@ def run_from_config(config_path: str) -> None:
 
     if cfg.get("cal_tt", False):
         logger.info("Calculating theoretical travel-time table...")
+        base = os.path.splitext(cfg["vel_model"])[0]
         TravelTime(
             filename=cfg["vel_model"],
-            tt_csv=cfg["tt_csv"],
+            tt_csv=base + "_tt.csv",
             ptt_npy=cfg["ptt_npy"],
             stt_npy=cfg["stt_npy"],
             sdepth_max=cfg["sdepth_max"],
@@ -230,7 +231,7 @@ def run_from_config(config_path: str) -> None:
             logger.warning(f"No phase CSV found for {year}-{month}-{day}: {phase_csv}")
             continue
 
-        csv_tensor = CsvTorch(cfg["ptt_npy"], cfg["stt_npy"], phase_csv, cfg["device"])
+        csv_tensor = CsvTorch(cfg["ptt_npy"], cfg["stt_npy"], phase_csv, cfg["device"], year, month, day)
         return_value = csv_tensor.generate_station_data()
         if not return_value:
             logger.warning(f"No valid phase data in {phase_csv}")

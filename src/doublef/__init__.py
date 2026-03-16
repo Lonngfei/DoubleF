@@ -1,5 +1,5 @@
 __program__ = "DoubleF"
-__version__ = "0.1.0"
+__version__ = "0.1.4"
 __author__ = "Longfei Duan"
 __email__ = "duanlongfei20@mails.ucas.ac.cn"
 __description__ = "A fast and flexible phase association and earthquake location method"
