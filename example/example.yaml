@@ -1,6 +1,9 @@
 input:
   # ---------------- Input Parameters ----------------
-  # Pick CSV path.
+  # Pick CSV path, or a directory containing multiple pick CSV files.
+  # If the data volume is large, splitting picks into multiple CSV files can
+  # reduce single-run GPU memory pressure. In that case, each output phase file
+  # is named after the corresponding input CSV prefix.
   pick-directory: example.csv
 
   # Station metadata CSV.

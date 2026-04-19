@@ -5,32 +5,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="2ac4cbb5-a6de-42ec-818e-36274e30d070" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/DoubleF.iml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/example/example.config" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/example/picks/20190704.csv" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/example/traveltime/mymodel.nd" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/pyproject.toml" beforeDir="false" afterPath="$PROJECT_DIR$/pyproject.toml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/batch_cal_score.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/batch_weight.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/cal_score.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/cli.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/csv_tensor.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/get_tt.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/img/plot.png" beforeDir="false" afterPath="$PROJECT_DIR$/src/doublef/img/plot.png" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/main.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/multiple_iteration.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/sampling.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/transfer_pick.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/visual.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/weight.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/doublef/write_results.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -183,7 +158,8 @@
       <workItem from="1776428248483" duration="1116000" />
       <workItem from="1776429733516" duration="4478000" />
       <workItem from="1776436745615" duration="26590000" />
-      <workItem from="1776512656827" duration="41559000" />
+      <workItem from="1776512656827" duration="41854000" />
+      <workItem from="1776598552516" duration="7000" />
     </task>
     <servers />
   </component>

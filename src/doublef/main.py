@@ -419,7 +419,14 @@ def _list_pick_files(pick_path: str, station_file: str | None) -> list[str]:
         return [pick_path]
 
     if os.path.isdir(pick_path):
-        raise ValueError(f"'input.pick-directory' must point to a single pick CSV file, not a directory: {pick_path}")
+        pick_files = sorted(
+            os.path.join(pick_path, filename)
+            for filename in os.listdir(pick_path)
+            if filename.lower().endswith(".csv")
+        )
+        if not pick_files:
+            raise ValueError(f"No pick CSV files were found in directory: {pick_path}")
+        return pick_files
 
     raise FileNotFoundError(f"Pick path does not exist: {pick_path}")
 
@@ -570,9 +577,16 @@ def write_phase_report(output_file: str, events: list[dict]) -> None:
                 f.write(" ".join(pick_fields) + "\n")
 
 
-def get_output_file_path(cfg: dict, exp_dir: str) -> str:
-    filename = f"{cfg['code']}.phase"
+def get_output_file_path(exp_dir: str, pick_file: str) -> str:
+    prefix = os.path.splitext(os.path.basename(pick_file))[0]
+    filename = f"{prefix}.phase"
     return os.path.join(exp_dir, filename)
+
+
+def _reset_perf_stats(logger: logging.Logger) -> None:
+    logger._doublef_perf_total = {}
+    logger._doublef_perf_self = {}
+    logger._doublef_perf_stack = []
 
 
 
@@ -1054,111 +1068,114 @@ def run_from_config(config_path: str) -> None:
     score_event_batch_size = 10 ** 9
     result_batch_size = 10 ** 9
 
-    with timed(logger, "prep.load_pick_dataframe"):
-        raw_pick_df = load_pick_dataframe(pick_files[0], cfg["station_file"])
-    final_events, file_stats = _associate_pick_dataframe(
-        raw_pick_df,
-        cfg,
-        logger,
-        cache_dir,
-        distance_step_km,
-        depth_step_km,
-        p_tt_matrix,
-        s_tt_matrix,
-        static_max_tt,
-        sample_index,
-        top_number_index,
-        number_weight_index,
-        time_weight_index,
-        confidence_level_index,
-        sampling_batch_size,
-        score_event_batch_size,
-        result_batch_size,
-        file_tag="",
-    )
-    del raw_pick_df
-    with timed(logger, "prep.file_gc_collect"):
-        gc.collect()
-
-    total_input_count = int(file_stats["total"])
-    total_p_count = int(file_stats["p_total"])
-    total_s_count = int(file_stats["s_total"])
-    earliest_reference_time = file_stats["reference_time"]
-
-    if total_p_count == 0:
-        logger.warning("No P-phase records were found in the input.")
-        return
-
-    if earliest_reference_time is not None:
-        cfg["year0"] = int(earliest_reference_time.year)
-        cfg["month0"] = int(earliest_reference_time.month)
-        cfg["day0"] = int(earliest_reference_time.day)
-        write_effective_config(parsed_cfg_path, cfg)
-
-    logger.info(f"Input summary: total={total_input_count}, P={total_p_count}, S={total_s_count}")
-
-    final_events = assign_final_event_ids(final_events)
-    output_file = get_output_file_path(cfg, exp_dir)
-    with timed(logger, "post.write_report"):
-        write_phase_report(output_file, final_events)
-
-    total_p_used = sum(event["count_p"] for event in final_events)
-    total_s_used = sum(event["count_s"] for event in final_events)
-    total_both_used = sum(event["count_both"] for event in final_events)
-    total_paired_phases = total_both_used * 2
-    total_associated_phases = total_p_used + total_s_used
-    paired_phase_ratio = (total_paired_phases * 100 / total_associated_phases) if total_associated_phases > 0 else 0.0
-    p_ratio = (total_p_used * 100 / total_p_count) if total_p_count > 0 else 0.0
-    s_ratio = (total_s_used * 100 / total_s_count) if total_s_count > 0 else 0.0
-    logger.info(f"Accepted events: {len(final_events)}")
-    logger.info(f"P used: {total_p_used} / {total_p_count} ({p_ratio:.2f}%)")
-    if total_s_count > 0:
-        logger.info(f"S used: {total_s_used} / {total_s_count} ({s_ratio:.2f}%)")
-    logger.info(f"P-S paired: {total_paired_phases} / {total_associated_phases} ({paired_phase_ratio:.2f}%)")
-    if final_events:
-        avg_p_per_event = total_p_used / len(final_events)
-        avg_s_per_event = total_s_used / len(final_events)
-        avg_both_per_event = total_both_used / len(final_events)
-        avg_rms = _mean_event_metric(final_events, "rms")
-        avg_err_lat = _mean_event_metric(final_events, "err_lat")
-        avg_err_lon = _mean_event_metric(final_events, "err_lon")
-        avg_err_dep = _mean_event_metric(final_events, "err_dep")
-        avg_err_time = _mean_event_metric(final_events, "err_time")
-        logger.info(
-            f"Catalog averages: P/event={avg_p_per_event:.2f}, "
-            f"S/event={avg_s_per_event:.2f}, PS-both/event={avg_both_per_event:.2f}, "
-            f"RMS={avg_rms:.3f}s"
+    for pick_file in pick_files:
+        _reset_perf_stats(logger)
+        logger.info(f"Processing pick file: {pick_file}")
+        with timed(logger, "prep.load_pick_dataframe"):
+            raw_pick_df = load_pick_dataframe(pick_file, cfg["station_file"])
+        final_events, file_stats = _associate_pick_dataframe(
+            raw_pick_df,
+            cfg,
+            logger,
+            cache_dir,
+            distance_step_km,
+            depth_step_km,
+            p_tt_matrix,
+            s_tt_matrix,
+            static_max_tt,
+            sample_index,
+            top_number_index,
+            number_weight_index,
+            time_weight_index,
+            confidence_level_index,
+            sampling_batch_size,
+            score_event_batch_size,
+            result_batch_size,
+            file_tag="",
         )
-        logger.info(
-            f"Catalog mean uncertainty: lat={avg_err_lat:.4f} deg, "
-            f"lon={avg_err_lon:.4f} deg, dep={avg_err_dep:.3f} km, "
-            f"time={avg_err_time:.3f} s"
-        )
-    logger.info(f"Output file: {output_file}")
-    timing_parts = []
-    perf_total_stats = getattr(logger, "_doublef_perf_total", {})
-    completed_rounds = max(
-        (
-            int(key.split(".")[0][5:])
-            for key in perf_total_stats
-            if key.startswith("round") and key.endswith(".total")
-        ),
-        default=0,
-    )
-    for idx in range(1, completed_rounds + 1):
-        round_total = get_time(logger, f"round{idx}.total", mode="total")
-        round_sample = get_time(logger, f"round{idx}.sample_batches", mode="total")
-        round_write = get_time(logger, f"round{idx}.write_results", mode="total")
-        if round_total > 0:
-            timing_parts.append(
-                f"round{idx}={round_total:.2f}s"
-                f" (sample={round_sample:.2f}s, write-results={round_write:.2f}s)"
+        del raw_pick_df
+        with timed(logger, "prep.file_gc_collect"):
+            gc.collect()
+
+        total_input_count = int(file_stats["total"])
+        total_p_count = int(file_stats["p_total"])
+        total_s_count = int(file_stats["s_total"])
+        earliest_reference_time = file_stats["reference_time"]
+
+        if total_p_count == 0:
+            logger.warning("No P-phase records were found in the input.")
+            continue
+
+        if len(pick_files) == 1 and earliest_reference_time is not None:
+            cfg["year0"] = int(earliest_reference_time.year)
+            cfg["month0"] = int(earliest_reference_time.month)
+            cfg["day0"] = int(earliest_reference_time.day)
+            write_effective_config(parsed_cfg_path, cfg)
+
+        logger.info(f"Input summary: total={total_input_count}, P={total_p_count}, S={total_s_count}")
+
+        final_events = assign_final_event_ids(final_events)
+        output_file = get_output_file_path(exp_dir, pick_file)
+        with timed(logger, "post.write_report"):
+            write_phase_report(output_file, final_events)
+
+        total_p_used = sum(event["count_p"] for event in final_events)
+        total_s_used = sum(event["count_s"] for event in final_events)
+        total_both_used = sum(event["count_both"] for event in final_events)
+        total_paired_phases = total_both_used * 2
+        total_associated_phases = total_p_used + total_s_used
+        paired_phase_ratio = (total_paired_phases * 100 / total_associated_phases) if total_associated_phases > 0 else 0.0
+        p_ratio = (total_p_used * 100 / total_p_count) if total_p_count > 0 else 0.0
+        s_ratio = (total_s_used * 100 / total_s_count) if total_s_count > 0 else 0.0
+        logger.info(f"Accepted events: {len(final_events)}")
+        logger.info(f"P used: {total_p_used} / {total_p_count} ({p_ratio:.2f}%)")
+        if total_s_count > 0:
+            logger.info(f"S used: {total_s_used} / {total_s_count} ({s_ratio:.2f}%)")
+        logger.info(f"P-S paired: {total_paired_phases} / {total_associated_phases} ({paired_phase_ratio:.2f}%)")
+        if final_events:
+            avg_p_per_event = total_p_used / len(final_events)
+            avg_s_per_event = total_s_used / len(final_events)
+            avg_both_per_event = total_both_used / len(final_events)
+            avg_rms = _mean_event_metric(final_events, "rms")
+            avg_err_lat = _mean_event_metric(final_events, "err_lat")
+            avg_err_lon = _mean_event_metric(final_events, "err_lon")
+            avg_err_dep = _mean_event_metric(final_events, "err_dep")
+            avg_err_time = _mean_event_metric(final_events, "err_time")
+            logger.info(
+                f"Catalog averages: P/event={avg_p_per_event:.2f}, "
+                f"S/event={avg_s_per_event:.2f}, PS-both/event={avg_both_per_event:.2f}, "
+                f"RMS={avg_rms:.3f}s"
             )
-    report_time = get_time(logger, "post.write_report", mode="total")
-    if report_time > 0:
-        timing_parts.append(f"write-report={report_time:.2f}s")
-    if timing_parts:
-        logger.info("Timing summary: " + ", ".join(timing_parts))
+            logger.info(
+                f"Catalog mean uncertainty: lat={avg_err_lat:.4f} deg, "
+                f"lon={avg_err_lon:.4f} deg, dep={avg_err_dep:.3f} km, "
+                f"time={avg_err_time:.3f} s"
+            )
+        logger.info(f"Output file: {output_file}")
+        timing_parts = []
+        perf_total_stats = getattr(logger, "_doublef_perf_total", {})
+        completed_rounds = max(
+            (
+                int(key.split(".")[0][5:])
+                for key in perf_total_stats
+                if key.startswith("round") and key.endswith(".total")
+            ),
+            default=0,
+        )
+        for idx in range(1, completed_rounds + 1):
+            round_total = get_time(logger, f"round{idx}.total", mode="total")
+            round_sample = get_time(logger, f"round{idx}.sample_batches", mode="total")
+            round_write = get_time(logger, f"round{idx}.write_results", mode="total")
+            if round_total > 0:
+                timing_parts.append(
+                    f"round{idx}={round_total:.2f}s"
+                    f" (sample={round_sample:.2f}s, write-results={round_write:.2f}s)"
+                )
+        report_time = get_time(logger, "post.write_report", mode="total")
+        if report_time > 0:
+            timing_parts.append(f"write-report={report_time:.2f}s")
+        if timing_parts:
+            logger.info("Timing summary: " + ", ".join(timing_parts))
 
     total_time = UTCDateTime() - start_time
     logger.info(f"Run completed in {total_time:.2f} seconds.")

@@ -1,6 +1,8 @@
 input:
   # ---------------- 输入参数 ----------------
-  # Pick CSV 路径。
+  # Pick CSV 路径，或包含多个 pick CSV 的目录。
+  # 如果数据量很大，可以拆分成多个 CSV，以降低单次运行的 GPU 显存压力。
+  # 此时每个输出的 phase 文件会使用对应输入 CSV 的前缀命名。
   pick-directory: example.csv
 
   # 台站元数据 CSV。
