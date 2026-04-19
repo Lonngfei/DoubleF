@@ -1,159 +1,134 @@
-
 # DoubleF
-#### A Fast and Flexible Phase Association and Earthquake Location Method Using Adaptive Sobol Sampling
-1. We define a search space over the source parameters and initialize it with a quasi-uniform set of samples generated using a Sobol sequence, which provides an efficient and systematic exploration of high-dimensional parameter spaces with low discrepancy. 
-2. The objective function is evaluated at each sampled point, and the search region is subsequently refined based on the quantile range of the top-value samples.
-3.  This process is implemented iteratively. In each iteration, the search space is progressively narrowed to focus on regions most likely to contain the global optimum. 
-4.  The iteration continues until a predefined convergence criterion is met. 
-5.  Finally, the sample with the highest objective function value is selected, and the phases associated within an acceptable residual threshold are considered the optimal association for the event.
+
+DoubleF is a phase association and earthquake location program based on adaptive Sobol sampling. It searches event latitude, longitude, depth, and origin time in a unified framework and progressively refines the search region around the best-scoring candidates.
 
 ![Iterative search process](src/doublef/img/plot.png)
 
-## Environment Setup and Installation
+## Highlights
 
-A dedicated Conda environment is recommended.
+- Adaptive Sobol sampling: efficient search in a 4-D source parameter space without an exhaustive grid.
+- Unified association and location: phase association and hypocenter estimation are solved together.
+- Flexible scoring: phase count, residual, probability, and distance weighting can be combined in different ways.
+- GPU acceleration: the main tensor computations can run on CUDA when available.
+- Stable output: final phase reports are aligned automatically and written in a compact format.
 
-### Create a Conda environment
-
-```bash
-conda create -n doublef python=3.9
-conda activate doublef
-pip install doublef
-```
-
-If you prefer to install from source inside the environment:
+## Installation
 
 ```bash
 conda create -n doublef python=3.9
 conda activate doublef
-git clone https://github.com/Lonngfei/DoubleF.git
-cd DoubleF
 pip install .
 ```
 
+If you want GPU execution, install a PyTorch build that matches your CUDA runtime before installing DoubleF.
 
-### GPU support
+## Command Line
 
-If you plan to run DoubleF on a GPU, make sure that your **PyTorch** version matches your **CUDA** version.
+Run DoubleF with a YAML config file:
 
-Please refer to the official PyTorch installation guide: [https://pytorch.org/get-started/previous-versions](https://pytorch.org/get-started/previous-versions).
-
-### Confirm CUDA availability
-
-Run the following in Python:
-
-```python
-import torch
-print(torch.cuda.is_available())
+```bash
+doublef example/example.yaml
 ```
 
-* `True`: CUDA is available and PyTorch can use your GPU.
-* `False`: Check the NVIDIA driver and CUDA-PyTorch compatibility.
-
-### Show program information
+Show program information:
 
 ```bash
 doublef
 ```
 
-This prints the program name,  version, and basic usage information.
+## Example
+
+The repository includes a runnable example in `example/`:
+
+- `example/example.yaml`: example configuration
+- `example/example.csv`: example pick file
+- `example/example_stations.csv`: station file
+- `example/tt/example.nd`: velocity model
+
+The public example uses `recompute-travel-time: true`, so the first run will build travel-time tables in `example/tt/`. After the tables are built, set it to `false` to avoid repeated travel-time computation.
 
 ## Input Files
 
-Before running DoubleF, make sure the required input files are correctly prepared.
+### Pick CSV
 
-Typical inputs include:
+Required columns:
 
-```text
-Picks/YYYYMMDD.csv       # Daily pick files
-TravelTime/mymodel.nd    # Velocity model used for travel-time calculation
-example.config           # Configuration file
-```
+- `network`
+- `station`
+- `phasetype`
+- `Time`
+- `Probability`
+- `Amplitude`
 
-The exact directory structure can be adjusted in the configuration file.
+### Station CSV
+
+Required columns:
+
+- `network`
+- `station`
+- `latitude`
+- `longitude`
+- `elevation`
+
+### Velocity Model
+
+DoubleF uses a 1-D velocity model file for travel-time calculation.
 
 ## Configuration
 
-DoubleF is controlled through a configuration file such as `example.config`.
+DoubleF is controlled by a YAML file. A complete example is provided in [`example/example.yaml`](example/example.yaml).
 
-Most parameters do not need frequent modification. In most cases, only a few settings require special attention.
+In normal use, most parameters do not strongly change the final result. You usually do not need to tune everything.
 
-### 1. Velocity model and travel-time table
+The two sections that deserve the most attention are:
 
-Set `cal_tt = True` when using a new velocity model.
+- `tolerance`
+- `output`
 
-This is usually required only once to generate the travel-time tables.
+These are strongly related to real data quality, station coverage, pick uncertainty, noise level, and the practical goal of the analysis.
 
-After the tables have been generated, set: `cal_tt = False`, so that the program loads the existing tables and skips recalculation.
+For larger search regions, broader study areas, or larger initial uncertainty, increasing `number-of-samples` is often beneficial. In many smaller and denser problems, the default sampling is already adequate.
 
-### 2. Sampling parameters
+For more detailed parameter descriptions, refer to the comments in the YAML file.
 
-In most applications, the default sampling settings are sufficient.
+## Output Files
 
-If the nearest-station distance is larger than **0.6°**, increasing the number of samples may improve the results.
-
-### 3. Score calculation
-
-DoubleF provides several alternative objective functions.
-
-In most cases, the choice among these objective functions does not significantly affect the final results.
-
-Users who are familiar with the method may further customize the scoring strategy if needed.
-
-A custom objective function can be implemented by modifying: ``weight.py``, ``batch_weight.py`` in the source code.
-
-### 4. Output settings
-
-Set the output directory and related options according to your needs.
-
-DoubleF automatically writes:
-
-* logs
-* configuration records
-* phase association results
-
-to the specified output path.
-
-### 5. Memory and speed
-
-#### `max_batch_size`
-
-This parameter only affects computational efficiency and does **not** affect the final results. 
-
-In general, a larger value may improve speed, but this is not always the case.  
-
-Once the computation reaches saturation, further increasing `max_batch_size` may provide little or no additional speedup, while leading to higher memory usage.
-
-### 6. Visualization
-
-Visualization is usually recommended to be turned off during normal runs. 
-
-It should only be enabled when intermediate inspection, debugging, or result checking is needed.
-
-
-## Running the Program
-
-Once the input files and configuration file are ready, run:
-
-```bash
-doublef example.config
-```
-
-If the installation and configuration are correct, DoubleF will start processing and write logs and results to the output directory.
-
-
-## Output Phase File Format
-
-A typical output phase file has the following format:
+Each run creates an experiment directory under `output.output-directory`, for example:
 
 ```text
-# Year Month Day Hour Minute Second Latitude Longitude Depth Magnitude ErrHorizontal ErrVertical ErrTime RMS NumP NumS NumBoth NumSum ID
-NET Station Distance PhaseTime Probability PhaseType Residual ML Mag Amplitude
+results/000-example/
 ```
 
-### Notes
+Typical files:
 
-* `ErrHorizontal`, `ErrVertical`, and `ErrTime` do not necessarily represent the true location uncertainty.
-*  These values describe the spatial dispersion of candidate solutions that are associated with the same nearby location. Specifically, they quantify the statistical deviation (e.g., mean or standard deviation) of these candidate locations relative to the final solution.
-*  If only a single candidate solution exists, the dispersion cannot be computed and the value is reported as **NaN**.
-*  When these values are unusually large or reported as NaN, the corresponding results should be interpreted with caution.
+- `example.log`: full log file
+- `Config.yaml`: normalized effective configuration used for the run
+- `example.phase`: final association and location report
+
+## Phase Report Format
+
+The phase report does not contain explanatory header lines.
+
+Each event consists of:
+
+- one event line
+- multiple associated pick lines
+
+### Event Line
+
+```text
+# YYYY MM DD HH MM SS LAT LON DEP MAG ERR_LAT ERR_LON ERR_DEP ERR_TIME RMS P S BOTH SUM ID
+```
+
+Important note:
+
+- `ERR_LAT`, `ERR_LON`, `ERR_DEP`, and `ERR_TIME` are not formal location errors.
+- They describe the spread of the final iteration search result around the selected solution.
+- Large values may indicate that the result is less stable, the sample count is insufficient, the quantile is too broad, or the solution space remains diffuse.
+- They should be interpreted as indicators of solution concentration, not as strict uncertainty estimates.
+
+### Pick Line
+
+```text
+NET STATION DIST PICK_TIME PROB PHASE RESIDUAL MAG AMP
+```

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "doublef"
-version = "0.1.4"
+version = "0.2.0"
 description = "DoubleF: A fast and flexible phase association and earthquake location method"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,19 +13,15 @@ authors = [
     { name = "Longfei Duan", email = "duanlongfei20@mails.ucas.ac.cn" }
 ]
 dependencies = [
-    "matplotlib==3.9.4",
-    "numpy==1.26.3",
-    "obspy==1.4.2",
-    "pandas==2.3.0",
-    "pyrocko==2025.1.21",
-    "scipy==1.13.1",
-    "sobol-seq==0.2.0",
-    "torch==2.3.1",
-    "torchaudio==2.3.1",
-    "torchvision==0.18.1",
-    "tqdm==4.67.1",
-    "natsort==8.4.0",
-    "pillow==10.4.0",
+    "numpy",
+    "obspy",
+    "pandas",
+    "pyrocko",
+    "pyyaml",
+    "scipy",
+    "sobol_seq",
+    "torch>=1.10",
+    "tqdm",
 ]
 
 [project.scripts]

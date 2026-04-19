@@ -1,0 +1,175 @@
+input:
+  # ---------------- 输入参数 ----------------
+  # Pick CSV 路径。
+  pick-directory: example.csv
+
+  # 台站元数据 CSV。
+  # 高程单位必须为 km。
+  station-file: example_stations.csv
+
+travel-time:
+  # ---------------- 走时参数 ----------------
+  # 用于生成或使用走时表的设置。
+  # 如果 recompute-travel-time = true，程序会根据指定的一维速度模型
+  # 重建走时缓存。否则，将加载已有走时表。
+  recompute-travel-time: true
+
+  # 一维速度模型文件路径。
+  velocity-model: tt/example.nd
+
+  # 为 true 时，使用台站高程建立走时表。
+  # 缓存会自动建立在速度模型文件旁边。
+  consider-station-elevation: false
+
+  # 建立走时表时使用的最大震源深度，单位 km。
+  maximum-source-depth-km: 30
+
+  # 建立走时表时使用的震源深度采样间隔，单位 km。
+  source-depth-step-km: 1
+
+  # 建立走时表时使用的最大震中距，单位度。
+  maximum-distance-deg: 2.0
+
+  # 建立走时表时使用的震中距采样间隔，单位度。
+  distance-step-deg: 0.01
+
+  # 最终缓存走时表使用的查找网格步长，单位 km。
+  # 更小的值会提高查找精度，但会增加缓存大小和建表时间。
+  lookup-grid-step-km: 0.01
+
+sampling:
+  # ---------------- 采样参数 ----------------
+  # 用于事件定位的迭代 Sobol 搜索参数。
+  # 每次迭代后，采样数按 multiple 的比例递减。
+
+  # 自适应 Sobol 采样的迭代次数。
+  number-of-iterations: 5
+
+  # 第一轮迭代生成的采样数。
+  number-of-samples: 5000
+
+  # 每次迭代后采样数的缩减比例。
+  multiple: 0.8
+
+  # 每次迭代保留的最佳候选数。
+  number-of-tops: 10
+
+  # 用于在迭代间收缩搜索范围的分位数。
+  quantile: 0.95
+
+  # 初始点周围的纬度搜索范围，单位度。
+  search-range-latitude-deg: 0.6
+
+  # 初始点周围的经度搜索范围，单位度。
+  search-range-longitude-deg: 0.6
+
+  # 初始点周围的深度搜索范围，单位 km。
+  search-range-depth-km: 30
+
+  # 初始点周围的发震时刻搜索范围，单位秒。
+  search-range-time-s: 12
+
+  # 第一轮关联完成后的重复轮数。
+  # 0 表示不重复；1 表示增加一轮；2 表示增加两轮；……
+  # -1 表示持续重复直到不再产出新事件。
+  repeat-rounds: 1
+
+scoring:
+  # ---------------- 评分参数 ----------------
+  # 用于定义候选事件如何被评估和排序。
+
+  # 允许关联的最大震中距，单位 km。
+  maximum-association-distance-km: 200
+
+  # 相位数评分所占权重。
+  phase-count-weight: 0.95
+
+  # 震级一致性评分所占权重。
+  magnitude-consistency-weight: 0
+
+  # P 相权重。
+  # S 相权重由 1 - p-phase-weight 计算得到。
+  p-phase-weight: 0.5
+
+  # 相位数评分方法。
+  # 控制关联相位数如何参与最终评分。
+  # 可选值：
+  #   number            : 使用关联相位数
+  #   prob_number       : 使用按拾取概率加权后的相位数
+  #   number_both       : 联合统计 P 和 S 相
+  #   prob_number_both  : 联合统计 P 和 S 相，并按拾取概率加权
+  phase-count-method: prob_number_both
+
+  # 走时残差评分方法。
+  # 控制理论到时与观测到时之间的残差如何参与评分。
+  # 可选值：
+  #   rms               : 仅基于残差评分，不附加其他权重
+  #   distance_rms      : 残差按台站距离加权
+  #   prob_rms          : 残差按拾取概率加权
+  #   prob_distance_rms : 残差同时按距离和拾取概率加权
+  residual-method: prob_distance_rms
+
+  # 距离加权的下限阈值，单位 km。
+  distance-weight-lower-bound-km: 50
+
+  # 距离加权的上限阈值，单位 km。
+  distance-weight-upper-bound-km: 100
+
+tolerance:
+  # ---------------- 走时容差 ----------------
+  # 定义观测走时相对于理论走时允许的偏差范围。
+  # 如果 maximum residual = minimum residual，则使用常数容差。
+  # 如果 maximum residual > minimum residual，则容差随距离线性增大。
+
+  # P 波走时允许的最小偏差，单位秒。
+  minimum-p-residual-s: 0.3
+
+  # P 波走时允许的最大偏差，单位秒。
+  maximum-p-residual-s: 1.0
+
+  # S 波走时允许的最小偏差，单位秒。
+  minimum-s-residual-s: 0.5
+
+  # S 波走时允许的最大偏差，单位秒。
+  maximum-s-residual-s: 1.0
+
+output:
+  # ---------------- 输出参数 ----------------
+  # 用于决定事件是否被接受并写入最终目录。
+
+  # 当前实验或研究区域的代码或简称。
+  experiment-code: example
+
+  # 实验目录的创建位置。
+  output-directory: results
+
+  # P 相的最小数量要求。
+  minimum-p-phases: 0
+
+  # S 相的最小数量要求。
+  minimum-s-phases: 0
+
+  # 同时具有 P 和 S 相的台站最小数量要求。
+  minimum-p-and-s-stations: 5
+
+  # 相位总数的最小要求。
+  minimum-total-phases: 0
+
+  # 要求同一台站同时具有 P 和 S pick。
+  # 这在大区域或密集地震活动中有助于减少相位干扰。
+  require-p-and-s-at-same-station: false
+
+
+runtime:
+  # ---------------- 通用运行参数 ----------------
+  # 与运行方式和硬件相关的设置。
+
+  # 计算设备。可选值：cpu，cuda。
+  device: cuda
+
+  # 每个外层 batch 处理的 P seed 数量。
+  # 它影响的是批处理效率，而不是结果的物理含义。
+  glob-batch-size: 256
+
+  # 为 true 时，终端不输出，仅保留日志文件。
+  silent-screen: false

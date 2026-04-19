@@ -1,0 +1,175 @@
+input:
+  # ---------------- Input Parameters ----------------
+  # Pick CSV path.
+  pick-directory: example.csv
+
+  # Station metadata CSV.
+  # Elevation must be given in km.
+  station-file: example_stations.csv
+
+travel-time:
+  # ---------------- Travel-Time Parameters ----------------
+  # Settings for generating or using travel-time tables.
+  # If recompute-travel-time = true, the program rebuilds the travel-time cache
+  # from the specified 1-D velocity model. Otherwise, it loads existing tables.
+  recompute-travel-time: true
+
+  # Path to the 1-D velocity model file.
+  velocity-model: tt/example.nd
+
+  # When true, build travel-time tables using station elevation.
+  # The cache is created automatically next to the velocity-model file.
+  consider-station-elevation: false
+
+  # Maximum source depth used when building the travel-time table, in km.
+  maximum-source-depth-km: 30
+
+  # Source-depth sampling interval used when building the travel-time table, in km.
+  source-depth-step-km: 1
+
+  # Maximum epicentral distance used when building the travel-time table, in degrees.
+  maximum-distance-deg: 2.0
+
+  # Epicentral-distance sampling interval used when building the travel-time table, in degrees.
+  distance-step-deg: 0.01
+
+  # Lookup-grid step used for the final cached travel-time table, in km.
+  # Smaller values improve lookup precision but increase cache size and build time.
+  lookup-grid-step-km: 0.01
+
+sampling:
+  # ---------------- Sampling Parameters ----------------
+  # Parameters controlling the iterative Sobol search used for event location.
+  # The number of samples decreases by the factor multiple after each iteration.
+
+  # Number of iterations used in adaptive Sobol sampling.
+  number-of-iterations: 5
+
+  # Number of samples generated in the first iteration.
+  number-of-samples: 5000
+
+  # Reduction factor applied to the sample count after each iteration.
+  multiple: 0.8
+
+  # Number of top candidates retained after each iteration.
+  number-of-tops: 10
+
+  # Quantile used to narrow the search range between iterations.
+  quantile: 0.95
+
+  # Latitude search range around the initial point, in degrees.
+  search-range-latitude-deg: 0.6
+
+  # Longitude search range around the initial point, in degrees.
+  search-range-longitude-deg: 0.6
+
+  # Depth search range around the initial point, in km.
+  search-range-depth-km: 30
+
+  # Origin-time search range around the initial point, in seconds.
+  search-range-time-s: 12
+
+  # Number of repeat rounds after the first association round.
+  # 0 means no repeat; 1 means one additional round; 2 means two additional rounds; ...
+  # -1 means keep repeating until no new events are produced.
+  repeat-rounds: 1
+
+scoring:
+  # ---------------- Scoring Parameters ----------------
+  # Parameters defining how candidate events are evaluated and ranked.
+
+  # Maximum allowed epicentral distance for association, in km.
+  maximum-association-distance-km: 200
+
+  # Weight assigned to the phase-count-based score.
+  phase-count-weight: 0.95
+
+  # Weight assigned to the magnitude-consistency score.
+  magnitude-consistency-weight: 0
+
+  # Weight assigned to the P phase.
+  # The S-phase weight is computed as 1 - p-phase-weight.
+  p-phase-weight: 0.5
+
+  # Method for phase-count-based scoring.
+  # Controls how the number of associated phases contributes to the final score.
+  # Options:
+  #   number            : use the number of associated phases
+  #   prob_number       : phase count weighted by picking probability
+  #   number_both       : count P and S phases jointly
+  #   prob_number_both  : count P and S phases jointly and weight by picking probability
+  phase-count-method: prob_number_both
+
+  # Method for travel-time residual scoring.
+  # Controls how the travel-time residuals between theoretical and observed arrivals are evaluated.
+  # Options:
+  #   rms               : residual-based score without additional weighting
+  #   distance_rms      : residuals weighted by station distance
+  #   prob_rms          : residuals weighted by picking probability
+  #   prob_distance_rms : residuals weighted by both distance and picking probability
+  residual-method: prob_distance_rms
+
+  # Lower threshold for distance weighting, in km.
+  distance-weight-lower-bound-km: 50
+
+  # Upper threshold for distance weighting, in km.
+  distance-weight-upper-bound-km: 100
+
+tolerance:
+  # ---------------- Travel-Time Tolerances ----------------
+  # Defines how much observed travel times can deviate from theoretical values.
+  # If maximum residual = minimum residual, a constant tolerance is used.
+  # If maximum residual > minimum residual, the tolerance increases linearly with distance.
+
+  # Minimum allowable deviation of P-wave travel time, in seconds.
+  minimum-p-residual-s: 0.3
+
+  # Maximum allowable deviation of P-wave travel time, in seconds.
+  maximum-p-residual-s: 1.0
+
+  # Minimum allowable deviation of S-wave travel time, in seconds.
+  minimum-s-residual-s: 0.5
+
+  # Maximum allowable deviation of S-wave travel time, in seconds.
+  maximum-s-residual-s: 1.0
+
+output:
+  # ---------------- Output Parameters ----------------
+  # Rules that determine whether an event is accepted and written to the final catalog.
+
+  # Code or short name identifying the current experiment or study region.
+  experiment-code: example
+
+  # Directory where experiment folders are created.
+  output-directory: results
+
+  # Minimum number of P phases required.
+  minimum-p-phases: 0
+
+  # Minimum number of S phases required.
+  minimum-s-phases: 0
+
+  # Minimum number of stations with both P and S phases required.
+  minimum-p-and-s-stations: 5
+
+  # Minimum total number of phases required.
+  minimum-total-phases: 0
+
+  # Require both P and S picks at a station.
+  # This is helpful in large study areas or dense seismicity to reduce phase interference.
+  require-p-and-s-at-same-station: false
+
+
+runtime:
+  # ---------------- General Runtime Parameters ----------------
+  # Runtime and hardware-related settings.
+
+  # Computation device. Supported values: cpu, cuda.
+  device: cuda
+
+  # Number of P seeds processed in each outer batch.
+  # It controls batching efficiency, not the physical meaning of the result.
+  glob-batch-size: 256
+
+  # When true, suppress terminal output and keep messages only in the log file.
+  silent-screen: false
