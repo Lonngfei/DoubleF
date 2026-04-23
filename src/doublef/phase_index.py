@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import numpy as np
 import pandas as pd
 import torch
@@ -6,6 +8,8 @@ from .perf import timed
 
 
 class PhasePickIndex:
+    _WINDOW_CACHE_SIZE = 2
+
     def __init__(
         self,
         phase_df,
@@ -20,9 +24,10 @@ class PhasePickIndex:
         lookup_query_chunk_size=4096,
     ):
         self.max_station_id = int(max_station_id)
-        self.device = device
+        self.compute_device = torch.device(device)
+        self.device = self.compute_device
         self.time_step = float(time_step)
-        self.window_lookup = window_lookup if window_lookup is not None else {}
+        self.window_lookup = window_lookup if window_lookup is not None else OrderedDict()
         self.logger = logger
         self.lookup_mode = str(lookup_mode)
         self.lookup_query_chunk_size = max(1, int(lookup_query_chunk_size))
@@ -31,6 +36,7 @@ class PhasePickIndex:
             self.df = self._prepare_df(phase_df)
             self.counts = counts or {"P": 0, "S": 0}
             self.padded_phase = phase_arrays
+            self.storage_device = self._phase_arrays_device(phase_arrays)
         else:
             if "pick_uid" not in phase_df.columns:
                 phase_df = phase_df.copy()
@@ -40,6 +46,7 @@ class PhasePickIndex:
                 "P": int((self.df["phasetype"] == "P").sum()),
                 "S": int((self.df["phasetype"] == "S").sum()),
             }
+            self.storage_device = torch.device("cpu")
             self.padded_phase = {}
             self._build_padded_arrays()
 
@@ -58,32 +65,56 @@ class PhasePickIndex:
             return phase_df
         return phase_df.sort_values("RelativeTime").reset_index(drop=True)
 
+    @staticmethod
+    def _phase_arrays_device(phase_arrays):
+        for phase_data in phase_arrays.values():
+            if isinstance(phase_data, dict) and "times" in phase_data:
+                return phase_data["times"].device
+        return torch.device("cpu")
+
+    def _empty_phase_arrays(self, device):
+        return {
+            "times": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=device),
+            "prob": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=device),
+            "amp": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=device),
+            "pick_uid": torch.empty((self.max_station_id, 0), dtype=torch.long, device=device),
+            "lengths": torch.zeros(self.max_station_id, dtype=torch.long, device=device),
+        }
+
+    def _phase_data_to_device(self, phase_data, device):
+        if phase_data["times"].device == device:
+            return phase_data
+        return {
+            key: value.to(device=device)
+            for key, value in phase_data.items()
+        }
+
+    def _cache_window_result(self, key, result):
+        self.window_lookup[key] = result
+        self.window_lookup.move_to_end(key)
+        while len(self.window_lookup) > self._WINDOW_CACHE_SIZE:
+            self.window_lookup.popitem(last=False)
+
     def _build_padded_arrays(self):
         for phase in ("P", "S"):
             phase_df = self.df[self.df["phasetype"] == phase]
             if phase_df.empty:
-                self.padded_phase[phase] = {
-                    "times": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                    "prob": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                    "amp": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                    "pick_uid": torch.empty((self.max_station_id, 0), dtype=torch.long, device=self.device),
-                    "lengths": torch.zeros(self.max_station_id, dtype=torch.long, device=self.device),
-                }
+                self.padded_phase[phase] = self._empty_phase_arrays(self.storage_device)
                 continue
 
             counts = phase_df.groupby("id").size().sort_index()
-            lengths = torch.zeros(self.max_station_id, dtype=torch.long, device=self.device)
+            lengths = torch.zeros(self.max_station_id, dtype=torch.long, device=self.storage_device)
             station_ids_np = counts.index.to_numpy(dtype=np.int64, copy=False)
             station_lengths_np = counts.to_numpy(dtype=np.int64, copy=False)
-            station_ids = torch.as_tensor(station_ids_np, dtype=torch.long, device=self.device)
-            station_lengths = torch.as_tensor(station_lengths_np, dtype=torch.long, device=self.device)
+            station_ids = torch.as_tensor(station_ids_np, dtype=torch.long, device=self.storage_device)
+            station_lengths = torch.as_tensor(station_lengths_np, dtype=torch.long, device=self.storage_device)
             lengths[station_ids] = station_lengths
             max_len = int(station_lengths.max().item())
 
-            times = torch.full((self.max_station_id, max_len), float("inf"), dtype=torch.float32, device=self.device)
-            prob = torch.full((self.max_station_id, max_len), float("nan"), dtype=torch.float32, device=self.device)
-            amp = torch.full((self.max_station_id, max_len), float("nan"), dtype=torch.float32, device=self.device)
-            pick_uid = torch.full((self.max_station_id, max_len), -1, dtype=torch.long, device=self.device)
+            times = torch.full((self.max_station_id, max_len), float("inf"), dtype=torch.float32, device=self.storage_device)
+            prob = torch.full((self.max_station_id, max_len), float("nan"), dtype=torch.float32, device=self.storage_device)
+            amp = torch.full((self.max_station_id, max_len), float("nan"), dtype=torch.float32, device=self.storage_device)
+            pick_uid = torch.full((self.max_station_id, max_len), -1, dtype=torch.long, device=self.storage_device)
 
             for station_id, group in phase_df.groupby("id", sort=False):
                 station_id = int(station_id)
@@ -92,22 +123,22 @@ class PhasePickIndex:
                 times[station_id, :length] = torch.as_tensor(
                     group["RelativeTime"].to_numpy(copy=False),
                     dtype=torch.float32,
-                    device=self.device,
+                    device=self.storage_device,
                 )
                 prob[station_id, :length] = torch.as_tensor(
                     group["Probability"].to_numpy(copy=False),
                     dtype=torch.float32,
-                    device=self.device,
+                    device=self.storage_device,
                 )
                 amp[station_id, :length] = torch.as_tensor(
                     group["Amplitude"].to_numpy(copy=False),
                     dtype=torch.float32,
-                    device=self.device,
+                    device=self.storage_device,
                 )
                 pick_uid[station_id, :length] = torch.as_tensor(
                     group["pick_uid"].to_numpy(copy=False),
                     dtype=torch.long,
-                    device=self.device,
+                    device=self.storage_device,
                 )
 
             self.padded_phase[phase] = {
@@ -119,19 +150,19 @@ class PhasePickIndex:
             }
 
     def lookup(self, phase, predicted_times, tolerance):
-        predicted_times = torch.as_tensor(predicted_times, dtype=torch.float32, device=self.device)
-        tolerance = torch.as_tensor(tolerance, dtype=torch.float32, device=self.device)
+        predicted_times = torch.as_tensor(predicted_times, dtype=torch.float32, device=self.compute_device)
+        tolerance = torch.as_tensor(tolerance, dtype=torch.float32, device=self.compute_device)
         result_shape = predicted_times.shape
-        phase_data = self.padded_phase[phase]
+        phase_data = self._phase_data_to_device(self.padded_phase[phase], self.compute_device)
         max_len = phase_data["times"].shape[1]
 
         if max_len == 0:
             return (
-                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.device),
-                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.device),
-                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.device),
-                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.device),
-                torch.full(result_shape, -1, dtype=torch.long, device=self.device),
+                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
+                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
+                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
+                torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
+                torch.full(result_shape, -1, dtype=torch.long, device=self.compute_device),
             )
 
         flat_query = predicted_times.reshape(-1, self.max_station_id).transpose(0, 1).contiguous()
@@ -185,7 +216,7 @@ class PhasePickIndex:
             prob = torch.full_like(flat_query, float("nan"))
             amp = torch.full_like(flat_query, float("nan"))
             pick = torch.full_like(flat_query, float("nan"))
-            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.device)
+            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.compute_device)
 
             err = torch.where(matched, flat_query - best_pick, err)
             prob = torch.where(matched, best_prob, prob)
@@ -201,7 +232,7 @@ class PhasePickIndex:
             prob = torch.full_like(flat_query, float("nan"))
             amp = torch.full_like(flat_query, float("nan"))
             pick = torch.full_like(flat_query, float("nan"))
-            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.device)
+            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.compute_device)
 
             for station_idx in range(self.max_station_id):
                 length = int(phase_data["lengths"][station_idx].item())
@@ -244,7 +275,7 @@ class PhasePickIndex:
             prob = torch.full_like(flat_query, float("nan"))
             amp = torch.full_like(flat_query, float("nan"))
             pick = torch.full_like(flat_query, float("nan"))
-            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.device)
+            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.compute_device)
 
             phase_times = phase_data["times"]
             phase_prob = phase_data["prob"]
@@ -287,7 +318,7 @@ class PhasePickIndex:
             return PhasePickIndex(
                 filtered,
                 self.max_station_id,
-                device=self.device,
+                device=self.compute_device,
                 time_step=self.time_step,
                 logger=self.logger,
                 lookup_mode=self.lookup_mode,
@@ -302,19 +333,14 @@ class PhasePickIndex:
         return df[df["phasetype"] == "P"].copy()
 
     def _slice_phase_window(self, phase_data, start_time, end_time):
+        phase_device = phase_data["times"].device
         max_len = phase_data["times"].shape[1]
         if max_len == 0:
-            empty_lengths = torch.zeros(self.max_station_id, dtype=torch.long, device=self.device)
-            return {
-                "times": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                "prob": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                "amp": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                "pick_uid": torch.empty((self.max_station_id, 0), dtype=torch.long, device=self.device),
-                "lengths": empty_lengths,
-            }, 0
+            empty_phase = self._empty_phase_arrays(phase_device)
+            return empty_phase, 0
 
-        start_values = torch.full((self.max_station_id, 1), float(start_time), dtype=torch.float32, device=self.device)
-        end_values = torch.full((self.max_station_id, 1), float(end_time), dtype=torch.float32, device=self.device)
+        start_values = torch.full((self.max_station_id, 1), float(start_time), dtype=torch.float32, device=phase_device)
+        end_values = torch.full((self.max_station_id, 1), float(end_time), dtype=torch.float32, device=phase_device)
 
         start_idx = torch.searchsorted(phase_data["times"], start_values, right=False).squeeze(1)
         end_idx = torch.searchsorted(phase_data["times"], end_values, right=True).squeeze(1)
@@ -322,15 +348,11 @@ class PhasePickIndex:
         max_window_len = int(lengths.max().item())
 
         if max_window_len == 0:
-            return {
-                "times": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                "prob": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                "amp": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=self.device),
-                "pick_uid": torch.empty((self.max_station_id, 0), dtype=torch.long, device=self.device),
-                "lengths": lengths,
-            }, 0
+            empty_phase = self._empty_phase_arrays(phase_device)
+            empty_phase["lengths"] = lengths
+            return empty_phase, 0
 
-        offsets = torch.arange(max_window_len, device=self.device).unsqueeze(0)
+        offsets = torch.arange(max_window_len, device=phase_device).unsqueeze(0)
         gather_idx = start_idx.unsqueeze(1) + offsets
         valid = offsets < lengths.unsqueeze(1)
         safe_idx = torch.where(valid, gather_idx, torch.zeros_like(gather_idx))
@@ -369,12 +391,8 @@ class PhasePickIndex:
         if s_start_time > s_end_time:
             s_start_time, s_end_time = s_end_time, s_start_time
 
-        min_time = float(self._relative_times[0])
-        max_time = float(self._relative_times[-1])
         overall_start = min(start_time, s_start_time)
         overall_end = max(end_time, s_end_time)
-        if overall_start <= min_time and overall_end >= max_time:
-            return self
 
         key = (
             int(np.floor(start_time / self.time_step)),
@@ -384,6 +402,7 @@ class PhasePickIndex:
         )
         cached = self.window_lookup.get(key)
         if cached is not None:
+            self.window_lookup.move_to_end(key)
             return cached
 
         with timed(self.logger, "phase_index.window"):
@@ -402,6 +421,10 @@ class PhasePickIndex:
                 p_phase, p_count = self._slice_phase_window(self.padded_phase["P"], start_time, end_time)
             with timed(self.logger, "phase_index.window.slice_s"):
                 s_phase, s_count = self._slice_phase_window(self.padded_phase["S"], s_start_time, s_end_time)
+            with timed(self.logger, "phase_index.window.materialize_p"):
+                p_phase = self._phase_data_to_device(p_phase, self.compute_device)
+            with timed(self.logger, "phase_index.window.materialize_s"):
+                s_phase = self._phase_data_to_device(s_phase, self.compute_device)
             phase_arrays = {"P": p_phase, "S": s_phase}
             counts = {"P": p_count, "S": s_count}
 
@@ -409,7 +432,7 @@ class PhasePickIndex:
                 result = PhasePickIndex(
                     window_df,
                     self.max_station_id,
-                    device=self.device,
+                    device=self.compute_device,
                     phase_arrays=phase_arrays,
                     counts=counts,
                     time_step=self.time_step,
@@ -418,5 +441,5 @@ class PhasePickIndex:
                     lookup_mode=self.lookup_mode,
                     lookup_query_chunk_size=self.lookup_query_chunk_size,
                 )
-        self.window_lookup[key] = result
+        self._cache_window_result(key, result)
         return result

@@ -68,7 +68,9 @@ class GetResult:
         self.datetime = datetime
         self.savename = savename
         self.result_batch_size = result_batch_size
-        self.device = device
+        self.device = torch.device(device)
+        self.max_p_tt = float(torch.nan_to_num(self.p_tt_matrix, nan=float("-inf")).max().item()) if self.p_tt_matrix.numel() > 0 else 0.0
+        self.max_s_tt = float(torch.nan_to_num(self.s_tt_matrix, nan=float("-inf")).max().item()) if self.s_tt_matrix.numel() > 0 else 0.0
 
     def _candidate_chunk_size(self, total_candidates):
         if self.result_batch_size and self.result_batch_size < 10 ** 8:
@@ -119,8 +121,8 @@ class GetResult:
         s_tt_distance = torch.where(valid_mask, s_tt_distance, torch.full_like(s_tt_distance, float("nan")))
         return p_tt_distance, s_tt_distance
 
-    def _lookup_for(self, phase, predicted_times, tolerance):
-        return self.phase_index.lookup(phase, predicted_times, tolerance)
+    def _lookup_for(self, lookup_index, phase, predicted_times, tolerance):
+        return lookup_index.lookup(phase, predicted_times, tolerance)
 
     def _passes_thresholds(self, count_p, count_s, count_both, count_sum):
         return (
@@ -199,17 +201,25 @@ class GetResult:
                     active_indices = torch.nonzero(active_mask_cpu, as_tuple=False).squeeze(1)
                 if active_indices.numel() == 0:
                     continue
-                active_indices_gpu = active_indices.to(self.device)
-
-                chunk_location = sorted_location_matrix[start:end].index_select(0, active_indices_gpu)
-                chunk_lower = sorted_lower_bound[start:end].index_select(0, active_indices_gpu)
-                chunk_upper = sorted_upper_bound[start:end].index_select(0, active_indices_gpu)
-                chunk_scores = sorted_scores[start:end].index_select(0, active_indices_gpu)
-                chunk_seed_uids = sorted_seed_pick_uids[start:end].index_select(0, active_indices_gpu)
-                chunk_batch_ids = (
-                    sorted_batch_ids[start:end].index_select(0, active_indices_gpu)
+                chunk_location_cpu = sorted_location_matrix[start:end].index_select(0, active_indices)
+                chunk_lower_cpu = sorted_lower_bound[start:end].index_select(0, active_indices)
+                chunk_upper_cpu = sorted_upper_bound[start:end].index_select(0, active_indices)
+                chunk_scores_cpu = sorted_scores[start:end].index_select(0, active_indices)
+                chunk_seed_uids_cpu = sorted_seed_pick_uids_cpu[start:end].index_select(0, active_indices)
+                chunk_batch_ids_cpu = (
+                    sorted_batch_ids[start:end].index_select(0, active_indices).cpu()
                     if sorted_batch_ids is not None else None
                 )
+
+                chunk_origin_min = float(chunk_lower_cpu[:, 3].min().item())
+                chunk_origin_max = float(chunk_upper_cpu[:, 3].max().item())
+                chunk_phase_index = self.phase_index.window(
+                    chunk_origin_min - self.p_tol_max,
+                    chunk_origin_max + self.p_tol_max + self.max_p_tt,
+                    s_start_time=chunk_origin_min - self.s_tol_max,
+                    s_end_time=chunk_origin_max + self.s_tol_max + self.max_s_tt,
+                )
+                chunk_location = chunk_location_cpu.to(self.device)
 
                 with timed(logger, "result.calculate_distances"):
                     chunk_distances = self._calculate_distances_for(chunk_location)
@@ -217,10 +227,10 @@ class GetResult:
                     p_tt_distance, s_tt_distance = self._get_theoretical_time_for(chunk_distances)
                 with timed(logger, "result.lookup_p"):
                     p_time_offset = (chunk_distances[:, :, 0] / self.max_distance) * (self.p_tol_max - self.p_tol_min) + self.p_tol_min
-                    p_err, p_prob, p_amp, p_pick, p_pick_uid = self._lookup_for("P", p_tt_distance, p_time_offset)
+                    p_err, p_prob, p_amp, p_pick, p_pick_uid = self._lookup_for(chunk_phase_index, "P", p_tt_distance, p_time_offset)
                 with timed(logger, "result.lookup_s"):
                     s_time_offset = (chunk_distances[:, :, 0] / self.max_distance) * (self.s_tol_max - self.s_tol_min) + self.s_tol_min
-                    s_err, s_prob, s_amp, s_pick, s_pick_uid = self._lookup_for("S", s_tt_distance, s_time_offset)
+                    s_err, s_prob, s_amp, s_pick, s_pick_uid = self._lookup_for(chunk_phase_index, "S", s_tt_distance, s_time_offset)
 
                 with timed(logger, "result.extract_events.prefilter"):
                     p_valid_all = (p_pick_uid >= 0) & torch.isfinite(p_pick)
@@ -247,13 +257,16 @@ class GetResult:
                     continue
 
                 with timed(logger, "result.extract_events.to_cpu"):
-                    chunk_location = chunk_location[accept_mask].cpu()
-                    chunk_lower = chunk_lower[accept_mask].cpu()
-                    chunk_upper = chunk_upper[accept_mask].cpu()
-                    chunk_scores = chunk_scores[accept_mask].cpu()
-                    chunk_seed_uids = chunk_seed_uids[accept_mask].cpu()
-                    if chunk_batch_ids is not None:
-                        chunk_batch_ids = chunk_batch_ids[accept_mask].cpu()
+                    accept_mask_cpu = accept_mask.cpu()
+                    chunk_location = chunk_location_cpu[accept_mask_cpu]
+                    chunk_lower = chunk_lower_cpu[accept_mask_cpu]
+                    chunk_upper = chunk_upper_cpu[accept_mask_cpu]
+                    chunk_scores = chunk_scores_cpu[accept_mask_cpu]
+                    chunk_seed_uids = chunk_seed_uids_cpu[accept_mask_cpu]
+                    if chunk_batch_ids_cpu is not None:
+                        chunk_batch_ids = chunk_batch_ids_cpu[accept_mask_cpu]
+                    else:
+                        chunk_batch_ids = None
                     chunk_distances = chunk_distances[accept_mask].cpu()
                     p_err = p_err[accept_mask].cpu()
                     s_err = s_err[accept_mask].cpu()
@@ -436,20 +449,28 @@ class GetResult:
         if self.event_number != 0 and self.i < 1:
             remaining_phase_index = self.phase_index.remove_pick_ids(used_pick_ids)
             if used_pick_mask is not None:
-                keep_mask = (~used_pick_mask[self.initial_seed_pick_uids.cpu()]).to(self.device)
+                keep_mask = ~used_pick_mask[self.initial_seed_pick_uids.cpu()]
             else:
-                keep_mask = torch.ones_like(self.initial_seed_pick_uids, dtype=torch.bool, device=self.device)
+                keep_mask = torch.ones_like(self.initial_seed_pick_uids, dtype=torch.bool, device="cpu")
             if self.initial_batch_ids is not None and successful_batch_ids:
-                successful_batch_mask = torch.zeros_like(keep_mask, dtype=torch.bool, device=self.device)
                 successful_batch_list = torch.tensor(
                     sorted(successful_batch_ids),
                     dtype=self.initial_batch_ids.dtype,
-                    device=self.device,
+                    device="cpu",
                 )
-                successful_batch_mask = (self.initial_batch_ids.unsqueeze(1) == successful_batch_list.unsqueeze(0)).any(dim=1)
+                # Batch IDs are assigned densely per outer batch, so a lookup table
+                # avoids the O(num_candidates * num_successful_batches) broadcast.
+                max_batch_id = int(self.initial_batch_ids.max().item())
+                successful_batch_lookup = torch.zeros(
+                    max_batch_id + 1,
+                    dtype=torch.bool,
+                    device="cpu",
+                )
+                successful_batch_lookup[successful_batch_list] = True
+                successful_batch_mask = successful_batch_lookup[self.initial_batch_ids.cpu()]
                 keep_mask &= successful_batch_mask
             elif self.initial_batch_ids is not None:
-                keep_mask &= torch.zeros_like(keep_mask, dtype=torch.bool, device=self.device)
+                keep_mask &= torch.zeros_like(keep_mask, dtype=torch.bool, device="cpu")
             next_location_matrix = self.initial_location_matrix[keep_mask]
             next_seed_pick_uids = self.initial_seed_pick_uids[keep_mask]
             next_batch_ids = self.initial_batch_ids[keep_mask] if self.initial_batch_ids is not None else None
@@ -457,7 +478,7 @@ class GetResult:
                 next_location_matrix = torch.cat(
                     [
                         next_location_matrix[:, :2],
-                        torch.zeros((next_location_matrix.shape[0], 1), dtype=torch.float32, device=self.device),
+                        torch.zeros((next_location_matrix.shape[0], 1), dtype=torch.float32, device="cpu"),
                         next_location_matrix[:, 3:4],
                     ],
                     dim=1,

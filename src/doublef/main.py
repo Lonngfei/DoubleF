@@ -679,12 +679,12 @@ def _associate_pick_dataframe(
     p_seed_location_values = torch.tensor(
         p_pick_df[["latitude", "longitude", "RelativeTime"]].to_numpy(),
         dtype=torch.float32,
-        device=cfg["device"],
+        device="cpu",
     )
     p_seed_pick_uids = torch.tensor(
         p_pick_df["pick_uid"].to_numpy(),
         dtype=torch.long,
-        device=cfg["device"],
+        device="cpu",
     )
     p_seed_times = p_seed_location_values[:, 2].clone()
 
@@ -727,12 +727,12 @@ def _associate_pick_dataframe(
             seed_location_values = torch.tensor(
                 seed_df[["latitude", "longitude", "RelativeTime"]].to_numpy(),
                 dtype=torch.float32,
-                device=cfg["device"],
+                device="cpu",
             )
             seed_pick_uids = torch.tensor(
                 seed_df["pick_uid"].to_numpy(),
                 dtype=torch.long,
-                device=cfg["device"],
+                device="cpu",
             )
             seed_times = seed_location_values[:, 2].clone()
 
@@ -740,7 +740,7 @@ def _associate_pick_dataframe(
         round_initial_location_matrix = torch.empty(
             (seed_count, 4),
             dtype=seed_location_values.dtype,
-            device=cfg["device"],
+            device="cpu",
         )
         round_lower_bound = None
         round_upper_bound = None
@@ -748,12 +748,12 @@ def _associate_pick_dataframe(
         round_seed_pick_uids = torch.empty(
             (seed_count,),
             dtype=seed_pick_uids.dtype,
-            device=cfg["device"],
+            device="cpu",
         )
         round_batch_ids = torch.empty(
             (seed_count,),
             dtype=torch.long,
-            device=cfg["device"],
+            device="cpu",
         )
 
         batch_starts = range(0, seed_count, outer_batch_size)
@@ -779,11 +779,12 @@ def _associate_pick_dataframe(
                         s_end_time=s_pick_max,
                     )
 
+                batch_location_values_gpu = batch_location_values.to(cfg["device"])
                 location_matrix = torch.cat(
                     [
-                        batch_location_values[:, :2],
+                        batch_location_values_gpu[:, :2],
                         torch.zeros((batch_location_values.shape[0], 1), dtype=torch.float32, device=cfg["device"]),
-                        batch_location_values[:, 2:],
+                        batch_location_values_gpu[:, 2:],
                     ],
                     dim=1,
                 )
@@ -831,27 +832,27 @@ def _associate_pick_dataframe(
                     round_score_matrix = torch.empty(
                         (seed_count, batch_top_samples.shape[1]),
                         dtype=batch_top_samples.dtype,
-                        device=batch_top_samples.device,
+                        device="cpu",
                     )
                     round_lower_bound = torch.empty(
                         (seed_count, sampler.final_lower_bound.shape[1]),
                         dtype=sampler.final_lower_bound.dtype,
-                        device=sampler.final_lower_bound.device,
+                        device="cpu",
                     )
                     round_upper_bound = torch.empty(
                         (seed_count, sampler.final_upper_bound.shape[1]),
                         dtype=sampler.final_upper_bound.dtype,
-                        device=sampler.final_upper_bound.device,
+                        device="cpu",
                     )
 
-                round_initial_location_matrix[batch_start:batch_end] = location_matrix
-                round_score_matrix[batch_start:batch_end] = batch_top_samples
-                round_lower_bound[batch_start:batch_end] = sampler.final_lower_bound
-                round_upper_bound[batch_start:batch_end] = sampler.final_upper_bound
+                round_initial_location_matrix[batch_start:batch_end] = location_matrix.cpu()
+                round_score_matrix[batch_start:batch_end] = batch_top_samples.cpu()
+                round_lower_bound[batch_start:batch_end] = sampler.final_lower_bound.cpu()
+                round_upper_bound[batch_start:batch_end] = sampler.final_upper_bound.cpu()
                 round_seed_pick_uids[batch_start:batch_end] = batch_pick_uids
                 round_batch_ids[batch_start:batch_end] = batch_start // outer_batch_size
 
-                del batch_phase_index, sampler, batch_top_samples
+                del batch_phase_index, sampler, batch_top_samples, batch_location_values_gpu
                 if (batch_end // outer_batch_size) % _BATCH_CLEANUP_INTERVAL == 0:
                     with timed(logger, "batch.cleanup"):
                         if torch.cuda.is_available():
