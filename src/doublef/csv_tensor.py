@@ -9,6 +9,44 @@ from .get_tt import station_key_to_filename, step_to_decimals
 PICK_TIME_BIN_SECONDS = 1
 
 
+def _days_before_year(year):
+    year = np.asarray(year, dtype=np.int64)
+    y = year - 1
+    return 365 * y + y // 4 - y // 100 + y // 400
+
+
+def _day_number(year, julday):
+    return _days_before_year(year) + np.asarray(julday, dtype=np.int64) - 1
+
+
+def datetime_to_time_code(datetimes):
+    dt = pd.to_datetime(datetimes, utc=True)
+    code = np.empty((len(dt), 6), dtype=np.float32)
+    code[:, 0] = dt.dt.year.to_numpy(dtype=np.int32, copy=False)
+    code[:, 1] = dt.dt.dayofyear.to_numpy(dtype=np.int32, copy=False)
+    code[:, 2] = dt.dt.hour.to_numpy(dtype=np.int32, copy=False)
+    code[:, 3] = dt.dt.minute.to_numpy(dtype=np.int32, copy=False)
+    code[:, 4] = dt.dt.second.to_numpy(dtype=np.int32, copy=False)
+    code[:, 5] = (dt.dt.microsecond.to_numpy(dtype=np.int64, copy=False) // 1000).astype(np.int32, copy=False)
+    return code
+
+
+def time_code_diff_seconds(time_code, reference_code):
+    code = np.asarray(time_code, dtype=np.float32)
+    ref = np.asarray(reference_code, dtype=np.float32)
+    code_i = code.astype(np.int64, copy=False)
+    ref_i = ref.astype(np.int64, copy=False)
+    day_diff = _day_number(code_i[:, 0], code_i[:, 1]) - _day_number(ref_i[0], ref_i[1])
+    diff_seconds = (
+        day_diff.astype(np.float32) * 86400.0
+        + (code[:, 2] - ref[2]) * 3600.0
+        + (code[:, 3] - ref[3]) * 60.0
+        + (code[:, 4] - ref[4])
+        + (code[:, 5] - ref[5]) * 0.001
+    )
+    return diff_seconds.astype(np.float32, copy=False)
+
+
 class CsvTorch(object):
     def __init__(
         self,
@@ -73,7 +111,15 @@ class CsvTorch(object):
             self.df["pick_uid"] = np.arange(len(self.df), dtype=np.int64)
         self.df["Time"] = pd.to_datetime(self.df["Time"], utc=True)
         self.reference_time = self._get_reference_time(self.df)
-        self.df["RelativeTime"] = (self.df["Time"] - self.reference_time).dt.total_seconds()
+        time_code = datetime_to_time_code(self.df["Time"])
+        reference_code = datetime_to_time_code(pd.Series([self.reference_time]))[0]
+        self.df["TimeYear"] = time_code[:, 0]
+        self.df["TimeJulday"] = time_code[:, 1]
+        self.df["TimeHour"] = time_code[:, 2]
+        self.df["TimeMinute"] = time_code[:, 3]
+        self.df["TimeSecond"] = time_code[:, 4]
+        self.df["TimeMillisecond"] = time_code[:, 5]
+        self.df["RelativeTime"] = time_code_diff_seconds(time_code, reference_code)
         self.df["RelativeTime"] = self.df["RelativeTime"].round(self.pick_time_round_decimals)
         self.df["net_sta"] = self.df["network"].astype(str) + "_" + self.df["station"].astype(str)
 

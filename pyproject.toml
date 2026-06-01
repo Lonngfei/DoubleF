@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68,<77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "doublef"
-version = "0.2.2"
+version = "0.2.3"
 description = "DoubleF: A fast and flexible phase association and earthquake location method"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -192,7 +192,7 @@ class BatchScore(object):
                            device=self.device, logger=self.logger)
             time_score_matrix = 1 - ts.cal()  # Shape: [B, N]
             time_score_matrix[torch.isnan(time_score_matrix)] = 0
-        self.score_index = self.number_weight * number_score_matrix + self.time_weight * time_score_matrix.squeeze(-1)
+        self.score_index = self.number_weight * number_score_matrix + self.time_weight * time_score_matrix
 
         # if self.magnitude_weight > 0:
         #     ms = MagnitudeScore(self.p_amp, self.s_amp, self.P_weight, self.S_weight, self.distances_matrix[:, :, 0],
