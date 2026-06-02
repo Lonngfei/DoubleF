@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 from time import perf_counter
 
@@ -24,12 +25,19 @@ class GetResult:
                  time_type, number_type, magnitude_type, dis0, dis1,
                  write_dict, sum_eve_num, sum_p_num, sum_s_num, sum_both_num,
                  p_number, s_number, sum_number, both_number, only_double, datetime, savename,
-                 result_batch_size=256, device='cuda', initial_batch_ids=None):
+                 result_batch_size=256, device='cuda', initial_batch_ids=None, batch_ref_msec=None, batch_window_msec=None,
+                 reference_global_msec=0, initial_used_pick_mask=None, enable_repeat=True, pick_global_msec=None):
         self.i = i
         self.max_distance = max_distance
         self.initial_location_matrix = initial_location_matrix
         self.initial_seed_pick_uids = initial_seed_pick_uids
         self.initial_batch_ids = initial_batch_ids
+        self.batch_ref_msec = batch_ref_msec or {}
+        self.batch_window_msec = batch_window_msec or {}
+        self.reference_global_msec = int(reference_global_msec)
+        self.initial_used_pick_mask = initial_used_pick_mask
+        self.enable_repeat = bool(enable_repeat)
+        self.pick_global_msec = pick_global_msec
         self.location_matrix = score_matrix[:, :4]
         self.input_score = score_matrix[:, 4]
         self.final_lower_bound = final_lower_bound
@@ -82,7 +90,7 @@ class GetResult:
         lon1 = torch.deg2rad(location_matrix[:, 1])
         lat2 = torch.deg2rad(self.station_matrix[:, 1])
         lon2 = torch.deg2rad(self.station_matrix[:, 2])
-        depth_time = location_matrix[:, 2:4]
+        depth = location_matrix[:, 2]
 
         lat1_expanded = lat1.unsqueeze(1)
         lon1_expanded = lon1.unsqueeze(1)
@@ -90,14 +98,12 @@ class GetResult:
         lon2_expanded = lon2.unsqueeze(0)
 
         distances = haversine_distance(lat1_expanded, lon1_expanded, lat2_expanded, lon2_expanded)
-        depth_time_expanded = depth_time.unsqueeze(1).expand(-1, distances.shape[1], -1)
-        return torch.cat([distances.unsqueeze(-1), depth_time_expanded], dim=-1)
+        return distances, depth, location_matrix[:, 3]
 
-    def _get_theoretical_time_for(self, distances_matrix):
-        N, S, _ = distances_matrix.shape
-        distances_raw = distances_matrix[:, :, 0]
-        depths_raw = distances_matrix[:, :, 1]
-        times_raw = distances_matrix[:, :, 2]
+    def _get_theoretical_time_for(self, distances_raw, depths_raw, times_raw):
+        N, S = distances_raw.shape
+        depths_raw = depths_raw.unsqueeze(1).expand(-1, S)
+        times_raw = times_raw.unsqueeze(1)
         valid_mask = distances_raw <= self.max_distance
 
         distances = torch.round(torch.clamp_min(distances_raw, 0.0) / self.tt_distance_step_km).long()
@@ -183,7 +189,22 @@ class GetResult:
         used_pick_ids = set()
         successful_batch_ids = set()
         max_pick_uid = int(self.phase_index.df["pick_uid"].max()) if not self.phase_index.df.empty else -1
-        used_pick_mask = torch.zeros(max_pick_uid + 1, dtype=torch.bool) if max_pick_uid >= 0 else None
+        if self.initial_used_pick_mask is not None:
+            used_pick_mask = self.initial_used_pick_mask.clone()
+            if max_pick_uid >= int(used_pick_mask.shape[0]):
+                expanded = torch.zeros(max_pick_uid + 1, dtype=torch.bool)
+                expanded[: used_pick_mask.shape[0]] = used_pick_mask
+                used_pick_mask = expanded
+        else:
+            used_pick_mask = torch.zeros(max_pick_uid + 1, dtype=torch.bool) if max_pick_uid >= 0 else None
+        if self.pick_global_msec is not None:
+            pick_global_msec = self.pick_global_msec
+        else:
+            pick_global_msec = np.full(max_pick_uid + 1, -1, dtype=np.int64) if max_pick_uid >= 0 else np.empty(0, dtype=np.int64)
+            if max_pick_uid >= 0:
+                pick_uid_values = self.phase_index.df["pick_uid"].to_numpy(dtype=np.int32, copy=False)
+                pick_global_values = self.phase_index.df["GlobalMsec"].to_numpy(dtype=np.int64, copy=False)
+                pick_global_msec[pick_uid_values] = pick_global_values
         magnitude_time = 0.0
         pick_loop_time = 0.0
         sort_filter_time = 0.0
@@ -197,7 +218,7 @@ class GetResult:
                 with timed(logger, "result.extract_events.seed_skip"):
                     active_mask_cpu = torch.ones(end - start, dtype=torch.bool)
                     if used_pick_mask is not None:
-                        active_mask_cpu &= ~used_pick_mask[sorted_seed_pick_uids_cpu[start:end]]
+                        active_mask_cpu &= ~used_pick_mask[sorted_seed_pick_uids_cpu[start:end].long()]
                     active_indices = torch.nonzero(active_mask_cpu, as_tuple=False).squeeze(1)
                 if active_indices.numel() == 0:
                     continue
@@ -211,26 +232,71 @@ class GetResult:
                     if sorted_batch_ids is not None else None
                 )
 
-                chunk_origin_min = float(chunk_lower_cpu[:, 3].min().item())
-                chunk_origin_max = float(chunk_upper_cpu[:, 3].max().item())
-                chunk_phase_index = self.phase_index.window(
-                    chunk_origin_min - self.p_tol_max,
-                    chunk_origin_max + self.p_tol_max + self.max_p_tt,
-                    s_start_time=chunk_origin_min - self.s_tol_max,
-                    s_end_time=chunk_origin_max + self.s_tol_max + self.max_s_tt,
-                )
-                chunk_location = chunk_location_cpu.to(self.device)
-
-                with timed(logger, "result.calculate_distances"):
-                    chunk_distances = self._calculate_distances_for(chunk_location)
-                with timed(logger, "result.get_theoretical_time"):
-                    p_tt_distance, s_tt_distance = self._get_theoretical_time_for(chunk_distances)
-                with timed(logger, "result.lookup_p"):
-                    p_time_offset = (chunk_distances[:, :, 0] / self.max_distance) * (self.p_tol_max - self.p_tol_min) + self.p_tol_min
-                    p_err, p_prob, p_amp, p_pick, p_pick_uid = self._lookup_for(chunk_phase_index, "P", p_tt_distance, p_time_offset)
-                with timed(logger, "result.lookup_s"):
-                    s_time_offset = (chunk_distances[:, :, 0] / self.max_distance) * (self.s_tol_max - self.s_tol_min) + self.s_tol_min
-                    s_err, s_prob, s_amp, s_pick, s_pick_uid = self._lookup_for(chunk_phase_index, "S", s_tt_distance, s_time_offset)
+                if chunk_batch_ids_cpu is None:
+                    raise ValueError("Local reference times require batch ids in write_results")
+                chunk_batch_ids_cpu = chunk_batch_ids_cpu.to(torch.long)
+                n_candidates = int(chunk_location_cpu.shape[0])
+                n_stations = int(self.station_matrix.shape[0])
+                chunk_distances = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                p_err = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                s_err = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                p_prob = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                s_prob = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                p_amp = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                s_amp = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                p_pick = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                s_pick = torch.full((n_candidates, n_stations), float("nan"), dtype=torch.float32)
+                p_pick_uid = torch.full((n_candidates, n_stations), -1, dtype=torch.int32)
+                s_pick_uid = torch.full((n_candidates, n_stations), -1, dtype=torch.int32)
+                with timed(logger, "result.relookup_candidates"):
+                    for event_batch_id in torch.unique(chunk_batch_ids_cpu).tolist():
+                        local_ref_msec = self.batch_ref_msec.get(int(event_batch_id))
+                        if local_ref_msec is None:
+                            raise ValueError(f"Missing local reference time for batch id {event_batch_id}")
+                        group_indices = torch.nonzero(chunk_batch_ids_cpu == int(event_batch_id), as_tuple=False).squeeze(1)
+                        group_location_cpu = chunk_location_cpu.index_select(0, group_indices)
+                        window_msec = self.batch_window_msec.get(int(event_batch_id))
+                        if window_msec is None:
+                            group_lower_cpu = chunk_lower_cpu.index_select(0, group_indices)
+                            group_upper_cpu = chunk_upper_cpu.index_select(0, group_indices)
+                            origin_min_local = float(group_lower_cpu[:, 3].min().item())
+                            origin_max_local = float(group_upper_cpu[:, 3].max().item())
+                            origin_min_abs = (local_ref_msec / 1000.0) + origin_min_local
+                            origin_max_abs = (local_ref_msec / 1000.0) + origin_max_local
+                            group_phase_index = self.phase_index.window(
+                                origin_min_abs - self.p_tol_max,
+                                origin_max_abs + self.p_tol_max + self.max_p_tt,
+                                s_start_time=origin_min_abs - self.s_tol_max,
+                                s_end_time=origin_max_abs + self.s_tol_max + self.max_s_tt,
+                                local_ref_msec=local_ref_msec,
+                            )
+                        else:
+                            p_start_msec, p_end_msec, s_start_msec, s_end_msec = window_msec
+                            group_phase_index = self.phase_index.window(
+                                p_start_msec / 1000.0,
+                                p_end_msec / 1000.0,
+                                s_start_time=s_start_msec / 1000.0,
+                                s_end_time=s_end_msec / 1000.0,
+                                local_ref_msec=local_ref_msec,
+                            )
+                        group_location = group_location_cpu.to(self.device)
+                        distances_raw, depths_raw, times_raw = self._calculate_distances_for(group_location)
+                        p_tt_distance, s_tt_distance = self._get_theoretical_time_for(distances_raw, depths_raw, times_raw)
+                        p_time_offset = (distances_raw / self.max_distance) * (self.p_tol_max - self.p_tol_min) + self.p_tol_min
+                        s_time_offset = (distances_raw / self.max_distance) * (self.s_tol_max - self.s_tol_min) + self.s_tol_min
+                        p_err_i, p_prob_i, p_amp_i, p_pick_i, p_pick_uid_i = self._lookup_for(group_phase_index, "P", p_tt_distance, p_time_offset)
+                        s_err_i, s_prob_i, s_amp_i, s_pick_i, s_pick_uid_i = self._lookup_for(group_phase_index, "S", s_tt_distance, s_time_offset)
+                        chunk_distances[group_indices] = distances_raw.cpu()
+                        p_err[group_indices] = p_err_i.cpu()
+                        s_err[group_indices] = s_err_i.cpu()
+                        p_prob[group_indices] = p_prob_i.cpu()
+                        s_prob[group_indices] = s_prob_i.cpu()
+                        p_amp[group_indices] = p_amp_i.cpu()
+                        s_amp[group_indices] = s_amp_i.cpu()
+                        p_pick[group_indices] = p_pick_i.cpu()
+                        s_pick[group_indices] = s_pick_i.cpu()
+                        p_pick_uid[group_indices] = p_pick_uid_i.cpu()
+                        s_pick_uid[group_indices] = s_pick_uid_i.cpu()
 
                 with timed(logger, "result.extract_events.prefilter"):
                     p_valid_all = (p_pick_uid >= 0) & torch.isfinite(p_pick)
@@ -267,17 +333,17 @@ class GetResult:
                         chunk_batch_ids = chunk_batch_ids_cpu[accept_mask_cpu]
                     else:
                         chunk_batch_ids = None
-                    chunk_distances = chunk_distances[accept_mask].cpu()
-                    p_err = p_err[accept_mask].cpu()
-                    s_err = s_err[accept_mask].cpu()
-                    p_prob = p_prob[accept_mask].cpu()
-                    s_prob = s_prob[accept_mask].cpu()
-                    p_amp = p_amp[accept_mask].cpu()
-                    s_amp = s_amp[accept_mask].cpu()
-                    p_pick = p_pick[accept_mask].cpu()
-                    s_pick = s_pick[accept_mask].cpu()
-                    p_pick_uid = p_pick_uid[accept_mask].cpu()
-                    s_pick_uid = s_pick_uid[accept_mask].cpu()
+                    chunk_distances = chunk_distances[accept_mask_cpu]
+                    p_err = p_err[accept_mask_cpu]
+                    s_err = s_err[accept_mask_cpu]
+                    p_prob = p_prob[accept_mask_cpu]
+                    s_prob = s_prob[accept_mask_cpu]
+                    p_amp = p_amp[accept_mask_cpu]
+                    s_amp = s_amp[accept_mask_cpu]
+                    p_pick = p_pick[accept_mask_cpu]
+                    s_pick = s_pick[accept_mask_cpu]
+                    p_pick_uid = p_pick_uid[accept_mask_cpu]
+                    s_pick_uid = s_pick_uid[accept_mask_cpu]
 
                 station_indices = torch.arange(chunk_distances.shape[1], device="cpu")
                 for i in range(chunk_location.size(0)):
@@ -295,14 +361,18 @@ class GetResult:
                     else:
                         rms = torch.tensor(float("nan"), dtype=torch.float32)
 
-                    event_time = self.datetime + time.item()
+                    local_ref_msec = self.batch_ref_msec.get(event_batch_id)
+                    if local_ref_msec is None:
+                        raise ValueError(f"Missing local reference time for batch id {event_batch_id}")
+                    origin_global_msec = int(local_ref_msec + round(float(time.item()) * 1000.0))
+                    event_time = self.datetime + ((origin_global_msec - self.reference_global_msec) / 1000.0)
                     t0 = perf_counter()
                     ms = MagnitudeScore(
                         p_amp[i],
                         s_amp[i],
                         0.5,
                         0.5,
-                        chunk_distances[i, :, 0],
+                        chunk_distances[i],
                         self.magnitude_type,
                         device="cpu",
                     )
@@ -310,7 +380,8 @@ class GetResult:
                     magnitude_time += perf_counter() - t0
 
                     event_record = {
-                        "origin_time": float(time.item()),
+                        "origin_time": origin_global_msec / 1000.0,
+                        "origin_global_msec": origin_global_msec,
                         "origin_datetime": event_time,
                         "location": {
                             "lat": float(lat.item()),
@@ -332,13 +403,13 @@ class GetResult:
                     }
 
                     t0 = perf_counter()
-                    valid_idx = ~torch.isnan(chunk_distances[i, :, 0])
+                    valid_idx = ~torch.isnan(chunk_distances[i])
                     if valid_idx.sum() == 0:
                         sort_filter_time += perf_counter() - t0
                         continue
 
                     idx_all = station_indices[valid_idx]
-                    sorted_dis = chunk_distances[i, valid_idx, 0]
+                    sorted_dis = chunk_distances[i, valid_idx]
                     sort_order = torch.argsort(sorted_dis)
                     idx_all = idx_all[sort_order]
 
@@ -354,8 +425,7 @@ class GetResult:
                     s_amp_all = s_amp[i, idx_all]
                     p_mag_all = p_mag[idx_all]
                     s_mag_all = s_mag[idx_all]
-                    dis_all = chunk_distances[i, idx_all, 0]
-                    time_shift = time
+                    dis_all = chunk_distances[i, idx_all]
 
                     if self.only_double:
                         valid_mask = (p_pick_uid_all >= 0) & (s_pick_uid_all >= 0)
@@ -383,13 +453,15 @@ class GetResult:
                         net, station = self.station_dic[idx]
 
                         if p_pick_uid_all[j] >= 0 and (used_pick_mask is None or not used_pick_mask[int(p_pick_uid_all[j].item())]):
+                            p_uid = int(p_pick_uid_all[j].item())
+                            relative_pick = (int(pick_global_msec[p_uid]) - origin_global_msec) / 1000.0
                             event_record["picks"].append({
                                 "phase": "P",
                                 "net": net,
                                 "station": station,
-                                "pick_uid": int(p_pick_uid_all[j].item()),
+                                "pick_uid": p_uid,
                                 "distance_km": float(dis_all[j]),
-                                "relative_pick": float(p_pick_all[j] - time_shift),
+                                "relative_pick": float(relative_pick),
                                 "pick_time": float(p_pick_all[j]),
                                 "prob": float(p_prob_all[j]),
                                 "err": float(p_err_all[j]),
@@ -398,13 +470,15 @@ class GetResult:
                             })
 
                         if s_pick_uid_all[j] >= 0 and (used_pick_mask is None or not used_pick_mask[int(s_pick_uid_all[j].item())]):
+                            s_uid = int(s_pick_uid_all[j].item())
+                            relative_pick = (int(pick_global_msec[s_uid]) - origin_global_msec) / 1000.0
                             event_record["picks"].append({
                                 "phase": "S",
                                 "net": net,
                                 "station": station,
-                                "pick_uid": int(s_pick_uid_all[j].item()),
+                                "pick_uid": s_uid,
                                 "distance_km": float(dis_all[j]),
-                                "relative_pick": float(s_pick_all[j] - time_shift),
+                                "relative_pick": float(relative_pick),
                                 "pick_time": float(s_pick_all[j]),
                                 "prob": float(s_prob_all[j]),
                                 "err": float(s_err_all[j]),
@@ -446,10 +520,10 @@ class GetResult:
             self.both_sum_number + self.sum_both_num,
         )
 
-        if self.event_number != 0 and self.i < 1:
+        if self.enable_repeat and self.event_number != 0 and self.i < 1:
             remaining_phase_index = self.phase_index.remove_pick_ids(used_pick_ids)
             if used_pick_mask is not None:
-                keep_mask = ~used_pick_mask[self.initial_seed_pick_uids.cpu()]
+                keep_mask = ~used_pick_mask[self.initial_seed_pick_uids.cpu().long()]
             else:
                 keep_mask = torch.ones_like(self.initial_seed_pick_uids, dtype=torch.bool, device="cpu")
             if self.initial_batch_ids is not None and successful_batch_ids:
@@ -473,28 +547,26 @@ class GetResult:
                 keep_mask &= torch.zeros_like(keep_mask, dtype=torch.bool, device="cpu")
             next_location_matrix = self.initial_location_matrix[keep_mask]
             next_seed_pick_uids = self.initial_seed_pick_uids[keep_mask]
-            next_batch_ids = self.initial_batch_ids[keep_mask] if self.initial_batch_ids is not None else None
+            next_seed_times = torch.from_numpy(pick_global_msec[next_seed_pick_uids.cpu().numpy()]).to(dtype=torch.long)
             if next_location_matrix.shape[0] > 0:
-                next_location_matrix = torch.cat(
-                    [
-                        next_location_matrix[:, :2],
-                        torch.zeros((next_location_matrix.shape[0], 1), dtype=torch.float32, device="cpu"),
-                        next_location_matrix[:, 3:4],
-                    ],
-                    dim=1,
-                )
                 return {
                     "continue": True,
                     "events": self.events,
                     "counts": counts,
-                    "location_matrix": next_location_matrix,
+                    "location_matrix": next_location_matrix[:, :2],
                     "initial_seed_pick_uids": next_seed_pick_uids,
-                    "initial_batch_ids": next_batch_ids,
+                    "seed_times": next_seed_times,
                     "phase_index": remaining_phase_index,
+                    "used_pick_ids": used_pick_ids,
+                    "used_pick_mask": used_pick_mask,
+                    "successful_batch_ids": successful_batch_ids,
                 }
 
         return {
             "continue": False,
             "events": self.events,
             "counts": counts,
+            "used_pick_ids": used_pick_ids,
+            "used_pick_mask": used_pick_mask,
+            "successful_batch_ids": successful_batch_ids,
         }

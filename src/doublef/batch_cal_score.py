@@ -30,7 +30,8 @@ class BatchScore(object):
                  p_tol_min, p_tol_max, s_tol_min, s_tol_max,
                  phase_index, p_tt_matrix, s_tt_matrix, tt_distance_step_km, tt_depth_step_km,
                  P_weight, S_weight, time_weight, number_weight, magnitude_weight,
-                 number_type, time_type, magnitude_type, dis0, dis1, event_batch_size=256, device='cuda', logger=None):
+                 number_type, time_type, magnitude_type, dis0, dis1, event_batch_size=256, device='cuda', logger=None,
+                 only_double=False):
         self.max_distance = max_distance
         self.location_matrix = torch.as_tensor(location_matrix, dtype=torch.float32, device=device)
         self.station_matrix = torch.as_tensor(station_matrix, dtype=torch.float32, device=device)
@@ -56,6 +57,7 @@ class BatchScore(object):
         self.event_batch_size = event_batch_size
         self.device = device
         self.logger = logger
+        self.only_double = bool(only_double)
 
     def _sample_chunk_size(self):
         total_samples, total_events, total_stations = self.location_matrix.shape[:3]
@@ -70,16 +72,10 @@ class BatchScore(object):
         :return:
         distance_matrix: B x N x S x 3; B: batch size; N: number of events; S: number of stations; 3: epicenter distance, depth, otime
         """
-        batch_size = self.location_matrix.shape[0]
-        num_events = self.location_matrix.shape[1]
-        num_stations = self.station_matrix.shape[0]
-
         lat1 = torch.deg2rad(self.location_matrix[:, :, 0])  # B x N
         lon1 = torch.deg2rad(self.location_matrix[:, :, 1])  # B x N
         lat2 = torch.deg2rad(self.station_matrix[:, 1])  # S
         lon2 = torch.deg2rad(self.station_matrix[:, 2])  # S
-
-        depth_time = self.location_matrix[:, :, 2:4]  # B x N x 2
 
         lat1_expanded = lat1.unsqueeze(2)  # B x N x 1
         lon1_expanded = lon1.unsqueeze(2)  # B x N x 1
@@ -89,9 +85,9 @@ class BatchScore(object):
 
         distances = haversine_distance(lat1_expanded, lon1_expanded, lat2_expanded, lon2_expanded)  # B x N x S
 
-        depth_time_expanded = depth_time.unsqueeze(2).expand(-1, -1, num_stations, -1)  # B x N x S x 2
-
-        self.distances_matrix = torch.cat([distances.unsqueeze(-1), depth_time_expanded], dim=-1)  # B x N x S x 3
+        self.distances_matrix = distances
+        self.depth_matrix = self.location_matrix[:, :, 2]
+        self.origin_time = self.location_matrix[:, :, 3]
 
         return self.distances_matrix
 
@@ -103,10 +99,10 @@ class BatchScore(object):
         s_tt_phases: B x N x S; B: batch size; N: number of events; S: number of stations
         ps_tt_phases: B x N x S; B: batch size; N: number of events; S: number of stations
         """
-        B, N, S, _ = self.distances_matrix.shape
-        distances_raw = self.distances_matrix[:, :, :, 0]
-        depths_raw = self.distances_matrix[:, :, :, 1]
-        times_raw = self.distances_matrix[:, :, :, 2]
+        B, N, S = self.distances_matrix.shape
+        distances_raw = self.distances_matrix
+        depths_raw = self.depth_matrix.unsqueeze(2).expand(-1, -1, S)
+        times_raw = self.origin_time.unsqueeze(2)
         valid_mask = distances_raw <= self.max_distance
 
         distances = torch.round(torch.clamp_min(distances_raw, 0.0) / self.tt_distance_step_km).long()
@@ -140,7 +136,7 @@ class BatchScore(object):
         p_amp: batch_size x N x S
         p_pick: batch_size x N x S
         """
-        p_time_offset = (self.distances_matrix[:, :, :, 0] / self.max_distance) * (self.p_tol_max - self.p_tol_min) + self.p_tol_min
+        p_time_offset = (self.distances_matrix / self.max_distance) * (self.p_tol_max - self.p_tol_min) + self.p_tol_min
         self.p_err, self.p_prob, self.p_amp, self.p_pick, self.p_pick_uid = self.phase_index.lookup(
             "P",
             self.p_tt_distance,
@@ -157,7 +153,7 @@ class BatchScore(object):
         s_amp: batch_size x N x S
         s_pick: batch_size x N x S
         """
-        s_time_offset = (self.distances_matrix[:, :, :, 0] / self.max_distance) * (self.s_tol_max - self.s_tol_min) + self.s_tol_min
+        s_time_offset = (self.distances_matrix / self.max_distance) * (self.s_tol_max - self.s_tol_min) + self.s_tol_min
         self.s_err, self.s_prob, self.s_amp, self.s_pick, self.s_pick_uid = self.phase_index.lookup(
             "S",
             self.s_tt_distance,
@@ -179,6 +175,19 @@ class BatchScore(object):
             self.cal_score_P()
         with timed(self.logger, "score.lookup_s"):
             self.cal_score_S()
+        if self.only_double:
+            with timed(self.logger, "score.only_double_filter"):
+                both_mask = (self.p_pick_uid >= 0) & (self.s_pick_uid >= 0)
+                self.p_prob = torch.where(both_mask, self.p_prob, torch.full_like(self.p_prob, float("nan")))
+                self.s_prob = torch.where(both_mask, self.s_prob, torch.full_like(self.s_prob, float("nan")))
+                self.p_err = torch.where(both_mask, self.p_err, torch.full_like(self.p_err, float("nan")))
+                self.s_err = torch.where(both_mask, self.s_err, torch.full_like(self.s_err, float("nan")))
+                self.p_amp = torch.where(both_mask, self.p_amp, torch.full_like(self.p_amp, float("nan")))
+                self.s_amp = torch.where(both_mask, self.s_amp, torch.full_like(self.s_amp, float("nan")))
+                self.p_pick = torch.where(both_mask, self.p_pick, torch.full_like(self.p_pick, float("nan")))
+                self.s_pick = torch.where(both_mask, self.s_pick, torch.full_like(self.s_pick, float("nan")))
+                self.p_pick_uid = torch.where(both_mask, self.p_pick_uid, torch.full_like(self.p_pick_uid, -1))
+                self.s_pick_uid = torch.where(both_mask, self.s_pick_uid, torch.full_like(self.s_pick_uid, -1))
         B, N, S = self.p_prob.shape
         with timed(self.logger, "score.number_score"):
             ns = NumberScore(self.p_prob, self.s_prob, self.P_weight, self.S_weight, S, self.number_type,
@@ -188,7 +197,7 @@ class BatchScore(object):
 
         with timed(self.logger, "score.time_score"):
             ts = TimeScore(self.p_tol_max, self.s_tol_max, self.p_err, self.s_err, self.p_prob, self.s_prob, self.P_weight,
-                           self.S_weight, self.distances_matrix[:, :, :,  0], self.dis0, self.dis1, self.time_type,
+                           self.S_weight, self.distances_matrix, self.dis0, self.dis1, self.time_type,
                            device=self.device, logger=self.logger)
             time_score_matrix = 1 - ts.cal()  # Shape: [B, N]
             time_score_matrix[torch.isnan(time_score_matrix)] = 0
@@ -238,6 +247,7 @@ class BatchScore(object):
                 event_batch_size=self.event_batch_size,
                 device=self.device,
                 logger=self.logger,
+                only_double=self.only_double,
             )
             score_chunks.append(chunk._cal_weight_score_impl())
             del chunk

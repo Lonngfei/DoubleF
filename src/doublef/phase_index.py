@@ -22,6 +22,8 @@ class PhasePickIndex:
         logger=None,
         lookup_mode="searchsorted",
         lookup_query_chunk_size=4096,
+        local_ref_msec=None,
+        reference_global_msec=None,
     ):
         self.max_station_id = int(max_station_id)
         self.compute_device = torch.device(device)
@@ -31,6 +33,8 @@ class PhasePickIndex:
         self.logger = logger
         self.lookup_mode = str(lookup_mode)
         self.lookup_query_chunk_size = max(1, int(lookup_query_chunk_size))
+        self.local_ref_msec = None if local_ref_msec is None else int(local_ref_msec)
+        self.reference_global_msec = None if reference_global_msec is None else int(reference_global_msec)
 
         if phase_arrays is not None:
             self.df = self._prepare_df(phase_df)
@@ -40,7 +44,9 @@ class PhasePickIndex:
         else:
             if "pick_uid" not in phase_df.columns:
                 phase_df = phase_df.copy()
-                phase_df["pick_uid"] = np.arange(len(phase_df), dtype=np.int64)
+                if len(phase_df) > np.iinfo(np.int32).max:
+                    raise ValueError("Too many picks for int32 pick_uid")
+                phase_df["pick_uid"] = np.arange(len(phase_df), dtype=np.int32)
             self.df = self._prepare_df(phase_df)
             self.counts = {
                 "P": int((self.df["phasetype"] == "P").sum()),
@@ -50,9 +56,12 @@ class PhasePickIndex:
             self.padded_phase = {}
             self._build_padded_arrays()
 
-        self._relative_times = (
-            self.df["RelativeTime"].to_numpy(dtype=np.float64, copy=False)
-            if not self.df.empty else np.empty(0, dtype=np.float64)
+        time_sort_col = "GlobalMsec" if "GlobalMsec" in self.df.columns else "RelativeTime"
+        time_dtype = np.int64 if time_sort_col == "GlobalMsec" else np.float64
+        self._time_sort_col = time_sort_col
+        self._sort_times = (
+            self.df[time_sort_col].to_numpy(dtype=time_dtype, copy=False)
+            if not self.df.empty else np.empty(0, dtype=time_dtype)
         )
 
     @staticmethod
@@ -61,9 +70,10 @@ class PhasePickIndex:
             return pd.DataFrame()
         if phase_df.empty:
             return phase_df.copy()
-        if phase_df["RelativeTime"].is_monotonic_increasing:
+        sort_col = "GlobalMsec" if "GlobalMsec" in phase_df.columns else "RelativeTime"
+        if phase_df[sort_col].is_monotonic_increasing:
             return phase_df
-        return phase_df.sort_values("RelativeTime").reset_index(drop=True)
+        return phase_df.sort_values(sort_col).reset_index(drop=True)
 
     @staticmethod
     def _phase_arrays_device(phase_arrays):
@@ -77,7 +87,7 @@ class PhasePickIndex:
             "times": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=device),
             "prob": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=device),
             "amp": torch.empty((self.max_station_id, 0), dtype=torch.float32, device=device),
-            "pick_uid": torch.empty((self.max_station_id, 0), dtype=torch.long, device=device),
+            "pick_uid": torch.empty((self.max_station_id, 0), dtype=torch.int32, device=device),
             "lengths": torch.zeros(self.max_station_id, dtype=torch.long, device=device),
         }
 
@@ -111,18 +121,26 @@ class PhasePickIndex:
             lengths[station_ids] = station_lengths
             max_len = int(station_lengths.max().item())
 
-            times = torch.full((self.max_station_id, max_len), float("inf"), dtype=torch.float32, device=self.storage_device)
+            time_dtype = torch.float32 if self.local_ref_msec is not None else torch.float64
+            times = torch.full((self.max_station_id, max_len), float("inf"), dtype=time_dtype, device=self.storage_device)
             prob = torch.full((self.max_station_id, max_len), float("nan"), dtype=torch.float32, device=self.storage_device)
             amp = torch.full((self.max_station_id, max_len), float("nan"), dtype=torch.float32, device=self.storage_device)
-            pick_uid = torch.full((self.max_station_id, max_len), -1, dtype=torch.long, device=self.storage_device)
+            pick_uid = torch.full((self.max_station_id, max_len), -1, dtype=torch.int32, device=self.storage_device)
 
             for station_id, group in phase_df.groupby("id", sort=False):
                 station_id = int(station_id)
-                group = group.sort_values("RelativeTime")
+                sort_col = "GlobalMsec" if "GlobalMsec" in group.columns else "RelativeTime"
+                group = group.sort_values(sort_col)
                 length = len(group)
+                if self.local_ref_msec is not None and "GlobalMsec" in group.columns:
+                    time_values = (group["GlobalMsec"].to_numpy(dtype=np.int64, copy=False) - self.local_ref_msec) / 1000.0
+                elif self.reference_global_msec is not None and "GlobalMsec" in group.columns:
+                    time_values = (group["GlobalMsec"].to_numpy(dtype=np.int64, copy=False) - self.reference_global_msec) / 1000.0
+                else:
+                    time_values = group["RelativeTime"].to_numpy(copy=False)
                 times[station_id, :length] = torch.as_tensor(
-                    group["RelativeTime"].to_numpy(copy=False),
-                    dtype=torch.float32,
+                    time_values,
+                    dtype=time_dtype,
                     device=self.storage_device,
                 )
                 prob[station_id, :length] = torch.as_tensor(
@@ -137,7 +155,7 @@ class PhasePickIndex:
                 )
                 pick_uid[station_id, :length] = torch.as_tensor(
                     group["pick_uid"].to_numpy(copy=False),
-                    dtype=torch.long,
+                    dtype=torch.int32,
                     device=self.storage_device,
                 )
 
@@ -162,7 +180,7 @@ class PhasePickIndex:
                 torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
                 torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
                 torch.full(result_shape, float("nan"), dtype=torch.float32, device=self.compute_device),
-                torch.full(result_shape, -1, dtype=torch.long, device=self.compute_device),
+                torch.full(result_shape, -1, dtype=torch.int32, device=self.compute_device),
             )
 
         flat_query = predicted_times.reshape(-1, self.max_station_id).transpose(0, 1).contiguous()
@@ -216,7 +234,7 @@ class PhasePickIndex:
             prob = torch.full_like(flat_query, float("nan"))
             amp = torch.full_like(flat_query, float("nan"))
             pick = torch.full_like(flat_query, float("nan"))
-            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.compute_device)
+            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.int32, device=self.compute_device)
 
             err = torch.where(matched, flat_query - best_pick, err)
             prob = torch.where(matched, best_prob, prob)
@@ -232,7 +250,7 @@ class PhasePickIndex:
             prob = torch.full_like(flat_query, float("nan"))
             amp = torch.full_like(flat_query, float("nan"))
             pick = torch.full_like(flat_query, float("nan"))
-            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.compute_device)
+            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.int32, device=self.compute_device)
 
             for station_idx in range(self.max_station_id):
                 length = int(phase_data["lengths"][station_idx].item())
@@ -275,7 +293,7 @@ class PhasePickIndex:
             prob = torch.full_like(flat_query, float("nan"))
             amp = torch.full_like(flat_query, float("nan"))
             pick = torch.full_like(flat_query, float("nan"))
-            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.long, device=self.compute_device)
+            pick_uid = torch.full(flat_query.shape, -1, dtype=torch.int32, device=self.compute_device)
 
             phase_times = phase_data["times"]
             phase_prob = phase_data["prob"]
@@ -323,6 +341,8 @@ class PhasePickIndex:
                 logger=self.logger,
                 lookup_mode=self.lookup_mode,
                 lookup_query_chunk_size=self.lookup_query_chunk_size,
+                local_ref_msec=self.local_ref_msec,
+                reference_global_msec=self.reference_global_msec,
             )
 
     def remaining_p_df(self, excluded_pick_ids=None):
@@ -339,8 +359,9 @@ class PhasePickIndex:
             empty_phase = self._empty_phase_arrays(phase_device)
             return empty_phase, 0
 
-        start_values = torch.full((self.max_station_id, 1), float(start_time), dtype=torch.float32, device=phase_device)
-        end_values = torch.full((self.max_station_id, 1), float(end_time), dtype=torch.float32, device=phase_device)
+        time_dtype = phase_data["times"].dtype
+        start_values = torch.full((self.max_station_id, 1), float(start_time), dtype=time_dtype, device=phase_device)
+        end_values = torch.full((self.max_station_id, 1), float(end_time), dtype=time_dtype, device=phase_device)
 
         start_idx = torch.searchsorted(phase_data["times"], start_values, right=False).squeeze(1)
         end_idx = torch.searchsorted(phase_data["times"], end_values, right=True).squeeze(1)
@@ -375,30 +396,52 @@ class PhasePickIndex:
             "lengths": lengths,
         }, int(lengths.sum().item())
 
-    def window(self, start_time, end_time, s_start_time=None, s_end_time=None):
-        start_time = float(start_time)
-        end_time = float(end_time)
+    def window(self, start_time, end_time, s_start_time=None, s_end_time=None, local_ref_msec=None, reference_global_msec=None):
+        child_reference_global_msec = self.reference_global_msec if reference_global_msec is None else int(reference_global_msec)
+        if self.df.empty:
+            return self
+
+        start_abs_msec = int(round(float(start_time) * 1000.0))
+        end_abs_msec = int(round(float(end_time) * 1000.0))
         if s_start_time is None:
             s_start_time = start_time
         if s_end_time is None:
             s_end_time = end_time
-        s_start_time = float(s_start_time)
-        s_end_time = float(s_end_time)
-        if self.df.empty:
-            return self
+        s_start_abs_msec = int(round(float(s_start_time) * 1000.0))
+        s_end_abs_msec = int(round(float(s_end_time) * 1000.0))
+
+        local_window = local_ref_msec is not None and self._time_sort_col == "GlobalMsec"
+        if local_window:
+            local_ref_msec = int(local_ref_msec)
+            start_time = (start_abs_msec - local_ref_msec) / 1000.0
+            end_time = (end_abs_msec - local_ref_msec) / 1000.0
+            s_start_time = (s_start_abs_msec - local_ref_msec) / 1000.0
+            s_end_time = (s_end_abs_msec - local_ref_msec) / 1000.0
+        else:
+            start_time = float(start_time)
+            end_time = float(end_time)
+            s_start_time = float(s_start_time)
+            s_end_time = float(s_end_time)
         if start_time > end_time:
             start_time, end_time = end_time, start_time
+            start_abs_msec, end_abs_msec = end_abs_msec, start_abs_msec
         if s_start_time > s_end_time:
             s_start_time, s_end_time = s_end_time, s_start_time
+            s_start_abs_msec, s_end_abs_msec = s_end_abs_msec, s_start_abs_msec
 
-        overall_start = min(start_time, s_start_time)
-        overall_end = max(end_time, s_end_time)
+        if local_window:
+            overall_start = min(start_abs_msec, s_start_abs_msec)
+            overall_end = max(end_abs_msec, s_end_abs_msec)
+        else:
+            overall_start = min(start_time, s_start_time)
+            overall_end = max(end_time, s_end_time)
 
         key = (
-            int(np.floor(start_time / self.time_step)),
-            int(np.ceil(end_time / self.time_step)),
-            int(np.floor(s_start_time / self.time_step)),
-            int(np.ceil(s_end_time / self.time_step)),
+            start_abs_msec if local_window else int(np.floor(start_time / self.time_step)),
+            end_abs_msec if local_window else int(np.ceil(end_time / self.time_step)),
+            s_start_abs_msec if local_window else int(np.floor(s_start_time / self.time_step)),
+            s_end_abs_msec if local_window else int(np.ceil(s_end_time / self.time_step)),
+            int(local_ref_msec) if local_ref_msec is not None else -1,
         )
         cached = self.window_lookup.get(key)
         if cached is not None:
@@ -407,26 +450,56 @@ class PhasePickIndex:
 
         with timed(self.logger, "phase_index.window"):
             with timed(self.logger, "phase_index.window.df_slice"):
-                start_idx = int(np.searchsorted(self._relative_times, overall_start, side="left"))
-                end_idx = int(np.searchsorted(self._relative_times, overall_end, side="right"))
+                start_idx = int(np.searchsorted(self._sort_times, overall_start, side="left"))
+                end_idx = int(np.searchsorted(self._sort_times, overall_end, side="right"))
                 window_df = self.df.iloc[start_idx:end_idx].copy()
                 if not window_df.empty:
-                    mask = (
-                        ((window_df["phasetype"] == "P") & (window_df["RelativeTime"] >= start_time) & (window_df["RelativeTime"] <= end_time))
-                        | ((window_df["phasetype"] == "S") & (window_df["RelativeTime"] >= s_start_time) & (window_df["RelativeTime"] <= s_end_time))
-                    )
+                    if local_window:
+                        p_times = window_df["GlobalMsec"]
+                        s_times = p_times
+                        mask = (
+                            ((window_df["phasetype"] == "P") & (p_times >= start_abs_msec) & (p_times <= end_abs_msec))
+                            | ((window_df["phasetype"] == "S") & (s_times >= s_start_abs_msec) & (s_times <= s_end_abs_msec))
+                        )
+                    else:
+                        mask = (
+                            ((window_df["phasetype"] == "P") & (window_df["RelativeTime"] >= start_time) & (window_df["RelativeTime"] <= end_time))
+                            | ((window_df["phasetype"] == "S") & (window_df["RelativeTime"] >= s_start_time) & (window_df["RelativeTime"] <= s_end_time))
+                        )
                     window_df = window_df[mask].copy()
+                if local_window and not window_df.empty:
+                    window_df["RelativeTime"] = (window_df["GlobalMsec"].to_numpy(dtype=np.int64, copy=False) - local_ref_msec) / 1000.0
 
-            with timed(self.logger, "phase_index.window.slice_p"):
-                p_phase, p_count = self._slice_phase_window(self.padded_phase["P"], start_time, end_time)
-            with timed(self.logger, "phase_index.window.slice_s"):
-                s_phase, s_count = self._slice_phase_window(self.padded_phase["S"], s_start_time, s_end_time)
-            with timed(self.logger, "phase_index.window.materialize_p"):
-                p_phase = self._phase_data_to_device(p_phase, self.compute_device)
-            with timed(self.logger, "phase_index.window.materialize_s"):
-                s_phase = self._phase_data_to_device(s_phase, self.compute_device)
-            phase_arrays = {"P": p_phase, "S": s_phase}
-            counts = {"P": p_count, "S": s_count}
+            if local_window:
+                ref_msec = child_reference_global_msec
+                ref_shift = (ref_msec - local_ref_msec) / 1000.0
+                p_start_ref = (start_abs_msec - ref_msec) / 1000.0
+                p_end_ref = (end_abs_msec - ref_msec) / 1000.0
+                s_start_ref = (s_start_abs_msec - ref_msec) / 1000.0
+                s_end_ref = (s_end_abs_msec - ref_msec) / 1000.0
+                with timed(self.logger, "phase_index.window.slice_p"):
+                    p_phase, p_count = self._slice_phase_window(self.padded_phase["P"], p_start_ref, p_end_ref)
+                with timed(self.logger, "phase_index.window.slice_s"):
+                    s_phase, s_count = self._slice_phase_window(self.padded_phase["S"], s_start_ref, s_end_ref)
+                with timed(self.logger, "phase_index.window.materialize_p"):
+                    p_phase = self._phase_data_to_device(p_phase, self.compute_device)
+                    p_phase["times"] = (p_phase["times"] + ref_shift).to(dtype=torch.float32)
+                with timed(self.logger, "phase_index.window.materialize_s"):
+                    s_phase = self._phase_data_to_device(s_phase, self.compute_device)
+                    s_phase["times"] = (s_phase["times"] + ref_shift).to(dtype=torch.float32)
+                phase_arrays = {"P": p_phase, "S": s_phase}
+                counts = {"P": p_count, "S": s_count}
+            else:
+                with timed(self.logger, "phase_index.window.slice_p"):
+                    p_phase, p_count = self._slice_phase_window(self.padded_phase["P"], start_time, end_time)
+                with timed(self.logger, "phase_index.window.slice_s"):
+                    s_phase, s_count = self._slice_phase_window(self.padded_phase["S"], s_start_time, s_end_time)
+                with timed(self.logger, "phase_index.window.materialize_p"):
+                    p_phase = self._phase_data_to_device(p_phase, self.compute_device)
+                with timed(self.logger, "phase_index.window.materialize_s"):
+                    s_phase = self._phase_data_to_device(s_phase, self.compute_device)
+                phase_arrays = {"P": p_phase, "S": s_phase}
+                counts = {"P": p_count, "S": s_count}
 
             with timed(self.logger, "phase_index.window.build_index"):
                 result = PhasePickIndex(
@@ -440,6 +513,8 @@ class PhasePickIndex:
                     logger=self.logger,
                     lookup_mode=self.lookup_mode,
                     lookup_query_chunk_size=self.lookup_query_chunk_size,
+                    local_ref_msec=local_ref_msec,
+                    reference_global_msec=child_reference_global_msec,
                 )
         self._cache_window_result(key, result)
         return result

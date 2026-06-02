@@ -7,13 +7,14 @@ import re
 from datetime import date, datetime
 from glob import glob
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
 from obspy import UTCDateTime
 from tqdm import tqdm
 
-from .csv_tensor import CsvTorch
+from .csv_tensor import CsvTorch, datetime_to_time_code, time_code_to_global_msec
 from .get_tt import TravelTime
 from .perf import get_time, timed
 from .phase_index import PhasePickIndex
@@ -25,6 +26,8 @@ _MISSING = object()
 _PICK_READ_CHUNK_ROWS = 200_000
 _PICK_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4})[-_]?(\d{2})[-_]?(\d{2})(?!\d)")
 _BATCH_CLEANUP_INTERVAL = 32
+_BATCH_TIME_WINDOW_MSEC = 3_600_000
+_LOCAL_REF_SAFETY_MSEC = 1_000
 
 _CONFIG_ALIASES = {
     "pick_dir": [("input", "pick-directory"), ("input", "pick-dir")],
@@ -451,7 +454,6 @@ def _pick_csv_columns(path: str, require_station_columns: bool) -> list[str]:
         "latitude",
         "longitude",
         "elevation",
-        "pick_uid",
     ]
     return [column for column in ordered_columns if column in available]
 
@@ -468,7 +470,6 @@ def _read_pick_csv(path: str, require_station_columns: bool) -> pd.DataFrame:
         "latitude": "float32",
         "longitude": "float32",
         "elevation": "float32",
-        "pick_uid": "int64",
     }
     read_kwargs = {
         "usecols": usecols,
@@ -629,6 +630,47 @@ def _associate_pick_dataframe(
     result_batch_size: int,
     file_tag: str = "",
 ) -> tuple[list[dict], dict]:
+    def _phase_pick_ids(phase_index: PhasePickIndex) -> np.ndarray:
+        pieces = []
+        for phase in ("P", "S"):
+            phase_data = phase_index.padded_phase.get(phase)
+            if not phase_data:
+                continue
+            ids = phase_data["pick_uid"].detach().cpu().numpy().reshape(-1)
+            ids = ids[ids >= 0]
+            if ids.size:
+                pieces.append(ids.astype(np.int32, copy=False))
+        if not pieces:
+            return np.empty(0, dtype=np.int32)
+        return np.unique(np.concatenate(pieces)).astype(np.int32, copy=False)
+
+    def _has_intersection(sorted_a: np.ndarray, sorted_b: np.ndarray) -> bool:
+        if sorted_a.size == 0 or sorted_b.size == 0:
+            return False
+        i = j = 0
+        len_a = int(sorted_a.size)
+        len_b = int(sorted_b.size)
+        while i < len_a and j < len_b:
+            a_value = sorted_a[i]
+            b_value = sorted_b[j]
+            if a_value == b_value:
+                return True
+            if a_value < b_value:
+                i += 1
+            else:
+                j += 1
+        return False
+
+    def _union_pick_ids(sorted_a: np.ndarray, sorted_b: np.ndarray) -> np.ndarray:
+        if sorted_a.size == 0:
+            return sorted_b
+        if sorted_b.size == 0:
+            return sorted_a
+        return np.union1d(sorted_a, sorted_b).astype(np.int32, copy=False)
+
+    def _windows_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
+        return int(start_a) <= int(end_b) and int(start_b) <= int(end_a)
+
     global_csv_tensor = CsvTorch(
         cache_dir,
         cfg["code"],
@@ -645,10 +687,11 @@ def _associate_pick_dataframe(
     if not return_value:
         return [], {"total": 0, "p_total": 0, "s_total": 0, "reference_time": None}
 
-    full_phase_df = global_csv_tensor.df.sort_values(["RelativeTime", "phasetype", "net_sta"]).reset_index(drop=True)
+    full_phase_df = global_csv_tensor.df.sort_values(["GlobalMsec", "phasetype", "net_sta"]).reset_index(drop=True)
     reference_time = global_csv_tensor.reference_time
     reference_utc = UTCDateTime(reference_time.to_pydatetime())
-    p_pick_df = full_phase_df[full_phase_df["phasetype"] == "P"].sort_values("RelativeTime").reset_index(drop=True)
+    reference_global_msec = int(time_code_to_global_msec(datetime_to_time_code(pd.Series([reference_time])))[0])
+    p_pick_df = full_phase_df[full_phase_df["phasetype"] == "P"].sort_values("GlobalMsec").reset_index(drop=True)
     s_pick_count = int((full_phase_df["phasetype"] == "S").sum())
     station_matrix, _station_number, station_dic = return_value
     stats = {
@@ -672,21 +715,27 @@ def _associate_pick_dataframe(
             logger=logger,
             lookup_mode=cfg["lookup_mode"],
             lookup_query_chunk_size=cfg["lookup_query_chunk_size"],
+            reference_global_msec=reference_global_msec,
         )
     global_csv_tensor.phase_df = None
     global_csv_tensor.df = None
 
     p_seed_location_values = torch.tensor(
-        p_pick_df[["latitude", "longitude", "RelativeTime"]].to_numpy(),
+        p_pick_df[["latitude", "longitude"]].to_numpy(),
         dtype=torch.float32,
+        device="cpu",
+    )
+    p_seed_global_msec = torch.tensor(
+        p_pick_df["GlobalMsec"].to_numpy(),
+        dtype=torch.long,
         device="cpu",
     )
     p_seed_pick_uids = torch.tensor(
         p_pick_df["pick_uid"].to_numpy(),
-        dtype=torch.long,
+        dtype=torch.int32,
         device="cpu",
     )
-    p_seed_times = p_seed_location_values[:, 2].clone()
+    p_seed_times = p_seed_global_msec
 
     local_p_tt_matrix = p_tt_matrix
     local_s_tt_matrix = s_tt_matrix
@@ -705,6 +754,18 @@ def _associate_pick_dataframe(
 
     outer_batch_size = cfg["glob_batch_size"] if cfg["glob_batch_size"] > 0 else 256
     global_event_counter = 0
+
+    def iter_time_batches(seed_times: torch.Tensor):
+        total = int(seed_times.shape[0])
+        start = 0
+        while start < total:
+            start_msec = int(seed_times[start].item())
+            time_end = start
+            while time_end < total and int(seed_times[time_end].item()) - start_msec <= _BATCH_TIME_WINDOW_MSEC:
+                time_end += 1
+            end = min(time_end, start + outer_batch_size)
+            yield start, end
+            start = end
 
     def run_global_round(
         seed_df: pd.DataFrame | None,
@@ -725,66 +786,190 @@ def _associate_pick_dataframe(
 
         if seed_location_values is None or seed_pick_uids is None or seed_times is None:
             seed_location_values = torch.tensor(
-                seed_df[["latitude", "longitude", "RelativeTime"]].to_numpy(),
+                seed_df[["latitude", "longitude"]].to_numpy(),
                 dtype=torch.float32,
                 device="cpu",
             )
             seed_pick_uids = torch.tensor(
                 seed_df["pick_uid"].to_numpy(),
+                dtype=torch.int32,
+                device="cpu",
+            )
+            seed_times = torch.tensor(
+                seed_df["GlobalMsec"].to_numpy(),
                 dtype=torch.long,
                 device="cpu",
             )
-            seed_times = seed_location_values[:, 2].clone()
 
         seed_count = int(seed_location_values.shape[0])
-        round_initial_location_matrix = torch.empty(
-            (seed_count, 4),
-            dtype=seed_location_values.dtype,
-            device="cpu",
-        )
-        round_lower_bound = None
-        round_upper_bound = None
-        round_score_matrix = None
-        round_seed_pick_uids = torch.empty(
-            (seed_count,),
-            dtype=seed_pick_uids.dtype,
-            device="cpu",
-        )
-        round_batch_ids = torch.empty(
-            (seed_count,),
-            dtype=torch.long,
-            device="cpu",
-        )
+        batch_ranges = list(iter_time_batches(seed_times))
+        round_events = []
+        used_pick_ids_total = set()
+        max_pick_uid = int(current_phase_index.df["pick_uid"].max()) if not current_phase_index.df.empty else -1
+        used_pick_mask = torch.zeros(max_pick_uid + 1, dtype=torch.bool) if max_pick_uid >= 0 else None
+        pick_global_msec = np.full(max_pick_uid + 1, -1, dtype=np.int64) if max_pick_uid >= 0 else np.empty(0, dtype=np.int64)
+        if max_pick_uid >= 0:
+            pick_uid_values = current_phase_index.df["pick_uid"].to_numpy(dtype=np.int32, copy=False)
+            pick_global_values = current_phase_index.df["GlobalMsec"].to_numpy(dtype=np.int64, copy=False)
+            pick_global_msec[pick_uid_values] = pick_global_values
+        successful_batch_ids_total = set()
+        batch_seed_records = []
+        pending_groups = []
+        round_counts = (0, 0, 0, 0)
 
-        batch_starts = range(0, seed_count, outer_batch_size)
+        def finalize_pending_group(group):
+            nonlocal used_pick_mask, used_pick_ids_total, successful_batch_ids_total, round_counts
+            group_items = group["items"]
+            if not group_items:
+                return
+            group_initial_location_matrix = torch.cat([item["initial_location_matrix"] for item in group_items], dim=0)
+            group_score_matrix = torch.cat([item["score_matrix"] for item in group_items], dim=0)
+            group_lower_bound = torch.cat([item["lower_bound"] for item in group_items], dim=0)
+            group_upper_bound = torch.cat([item["upper_bound"] for item in group_items], dim=0)
+            group_seed_pick_uids = torch.cat([item["seed_pick_uids"] for item in group_items], dim=0)
+            group_batch_ids = torch.cat([item["batch_ids"] for item in group_items], dim=0)
+            group_ref_msec = {}
+            group_window_msec = {}
+            for item in group_items:
+                group_ref_msec.update(item["batch_ref_msec"])
+                group_window_msec.update(item["batch_window_msec"])
+
+            group_write_dict = {"logger": logger}
+            with timed(logger, f"round{round_index}.pending.write_results"):
+                gr = GetResult(
+                    1,
+                    cfg["max_distance"],
+                    group_initial_location_matrix,
+                    group_score_matrix,
+                    station_matrix,
+                    group_lower_bound,
+                    group_upper_bound,
+                    group_seed_pick_uids,
+                    station_dic,
+                    cfg["min_P_tolerance"],
+                    cfg["max_P_tolerance"],
+                    cfg["min_S_tolerance"],
+                    cfg["max_S_tolerance"],
+                    current_phase_index,
+                    local_p_tt_matrix,
+                    local_s_tt_matrix,
+                    distance_step_km,
+                    depth_step_km,
+                    cfg["P_weight"],
+                    1 - cfg["P_weight"],
+                    0.95,
+                    0.05,
+                    0,
+                    cfg["time_type"],
+                    cfg["number_type"],
+                    "Continuous",
+                    cfg["dis0"],
+                    cfg["dis1"],
+                    group_write_dict,
+                    0,
+                    0,
+                    0,
+                    0,
+                    cfg["min_p"],
+                    cfg["min_s"],
+                    cfg["min_sum"],
+                    cfg["min_both"],
+                    cfg["only_double"],
+                    reference_utc,
+                    "",
+                    result_batch_size,
+                    device=cfg["device"],
+                    initial_batch_ids=group_batch_ids,
+                    batch_ref_msec=group_ref_msec,
+                    batch_window_msec=group_window_msec,
+                    reference_global_msec=reference_global_msec,
+                    initial_used_pick_mask=used_pick_mask,
+                    enable_repeat=False,
+                    pick_global_msec=pick_global_msec,
+                )
+                group_result = gr.write_results()
+
+            used_pick_mask = group_result.get("used_pick_mask", used_pick_mask)
+            group_used_pick_ids = group_result.get("used_pick_ids", set())
+            used_pick_ids_total.update(group_used_pick_ids)
+            successful_batch_ids_total.update(int(value) for value in group_result.get("successful_batch_ids", set()))
+            round_events.extend(group_result["events"])
+            round_counts = (
+                round_counts[0] + group_result["counts"][0],
+                round_counts[1] + group_result["counts"][1],
+                round_counts[2] + group_result["counts"][2],
+                round_counts[3] + group_result["counts"][3],
+            )
+
+        def make_pending_group(item, lookup_ids, lookup_start_msec, lookup_end_msec):
+            return {
+                "items": [item],
+                "lookup_ids": lookup_ids,
+                "lookup_start_msec": int(lookup_start_msec),
+                "lookup_end_msec": int(lookup_end_msec),
+            }
+
+        def merge_pending_groups(groups, item, lookup_ids, lookup_start_msec, lookup_end_msec):
+            merged_items = [item]
+            merged_lookup_ids = lookup_ids
+            merged_lookup_start = int(lookup_start_msec)
+            merged_lookup_end = int(lookup_end_msec)
+            for group in groups:
+                merged_items.extend(group["items"])
+                merged_lookup_ids = _union_pick_ids(merged_lookup_ids, group["lookup_ids"])
+                merged_lookup_start = min(merged_lookup_start, int(group["lookup_start_msec"]))
+                merged_lookup_end = max(merged_lookup_end, int(group["lookup_end_msec"]))
+            return {
+                "items": merged_items,
+                "lookup_ids": merged_lookup_ids,
+                "lookup_start_msec": merged_lookup_start,
+                "lookup_end_msec": merged_lookup_end,
+            }
+
         with timed(logger, f"round{round_index}.sample_batches"):
-            for batch_start in tqdm(batch_starts, desc=f"Round {round_index}", unit="batch", leave=False):
-                batch_end = min(batch_start + outer_batch_size, seed_count)
+            for batch_index, (batch_start, batch_end) in enumerate(tqdm(batch_ranges, desc=f"Round {round_index}", unit="batch", leave=False)):
                 batch_location_values = seed_location_values[batch_start:batch_end]
                 batch_pick_uids = seed_pick_uids[batch_start:batch_end]
                 batch_times = seed_times[batch_start:batch_end]
-                batch_p_min = float(batch_times[0].item())
-                batch_p_max = float(batch_times[-1].item())
-                origin_min = batch_p_min - cfg["search_time"]
-                origin_max = batch_p_max + 1.0
-                p_pick_min = origin_min - cfg["max_P_tolerance"]
-                p_pick_max = origin_max + cfg["max_P_tolerance"] + local_max_p_tt
-                s_pick_min = origin_min - cfg["max_S_tolerance"]
-                s_pick_max = origin_max + cfg["max_S_tolerance"] + local_max_s_tt
+                batch_p_min_msec = int(batch_times[0].item())
+                batch_p_max_msec = int(batch_times[-1].item())
+                search_msec = int(round(cfg["search_time"] * 1000.0))
+                p_tol_msec = int(round(cfg["max_P_tolerance"] * 1000.0))
+                s_tol_msec = int(round(cfg["max_S_tolerance"] * 1000.0))
+                max_tol_msec = max(p_tol_msec, s_tol_msec)
+                local_ref_msec = batch_p_min_msec - search_msec - max_tol_msec - _LOCAL_REF_SAFETY_MSEC
+                origin_min_msec = batch_p_min_msec - search_msec
+                origin_max_msec = batch_p_max_msec + 1000
+                p_pick_min_msec = origin_min_msec - p_tol_msec
+                p_pick_max_msec = origin_max_msec + p_tol_msec + int(round(local_max_p_tt * 1000.0))
+                s_pick_min_msec = origin_min_msec - s_tol_msec
+                s_pick_max_msec = origin_max_msec + s_tol_msec + int(round(local_max_s_tt * 1000.0))
+                batch_window = (
+                    p_pick_min_msec,
+                    p_pick_max_msec,
+                    s_pick_min_msec,
+                    s_pick_max_msec,
+                )
+                batch_lookup_start_msec = min(p_pick_min_msec, s_pick_min_msec)
+                batch_lookup_end_msec = max(p_pick_max_msec, s_pick_max_msec)
                 with timed(logger, "batch.window_phase_index"):
                     batch_phase_index = current_phase_index.window(
-                        p_pick_min,
-                        p_pick_max,
-                        s_start_time=s_pick_min,
-                        s_end_time=s_pick_max,
+                        p_pick_min_msec / 1000.0,
+                        p_pick_max_msec / 1000.0,
+                        s_start_time=s_pick_min_msec / 1000.0,
+                        s_end_time=s_pick_max_msec / 1000.0,
+                        local_ref_msec=local_ref_msec,
+                        reference_global_msec=reference_global_msec,
                     )
+                batch_lookup_ids = _phase_pick_ids(batch_phase_index)
 
                 batch_location_values_gpu = batch_location_values.to(cfg["device"])
+                batch_local_times = ((batch_times - local_ref_msec).to(torch.float32) / 1000.0).to(cfg["device"]).unsqueeze(1)
                 location_matrix = torch.cat(
                     [
                         batch_location_values_gpu[:, :2],
                         torch.zeros((batch_location_values.shape[0], 1), dtype=torch.float32, device=cfg["device"]),
-                        batch_location_values_gpu[:, 2:],
+                        batch_local_times,
                     ],
                     dim=1,
                 )
@@ -823,94 +1008,119 @@ def _associate_pick_dataframe(
                     sampling_batch_size,
                     score_event_batch_size,
                     cfg["device"],
+                    only_double=cfg["only_double"],
                 )
 
                 with timed(logger, "batch.sampler_only"):
                     batch_top_samples = sampler.run().squeeze(-1)
 
-                if round_score_matrix is None:
-                    round_score_matrix = torch.empty(
-                        (seed_count, batch_top_samples.shape[1]),
-                        dtype=batch_top_samples.dtype,
-                        device="cpu",
-                    )
-                    round_lower_bound = torch.empty(
-                        (seed_count, sampler.final_lower_bound.shape[1]),
-                        dtype=sampler.final_lower_bound.dtype,
-                        device="cpu",
-                    )
-                    round_upper_bound = torch.empty(
-                        (seed_count, sampler.final_upper_bound.shape[1]),
-                        dtype=sampler.final_upper_bound.dtype,
-                        device="cpu",
-                    )
+                pending_item = {
+                    "batch_index": batch_index,
+                    "initial_location_matrix": location_matrix.cpu(),
+                    "score_matrix": batch_top_samples.cpu(),
+                    "lower_bound": sampler.final_lower_bound.cpu(),
+                    "upper_bound": sampler.final_upper_bound.cpu(),
+                    "seed_pick_uids": batch_pick_uids,
+                    "seed_locations": batch_location_values,
+                    "seed_times": batch_times,
+                    "batch_ids": torch.full((batch_end - batch_start,), batch_index, dtype=torch.long, device="cpu"),
+                    "batch_ref_msec": {batch_index: local_ref_msec},
+                    "batch_window_msec": {batch_index: batch_window},
+                }
+                batch_seed_records.append({
+                    "batch_index": batch_index,
+                    "seed_pick_uids": batch_pick_uids,
+                    "seed_locations": batch_location_values,
+                    "seed_times": batch_times,
+                })
 
-                round_initial_location_matrix[batch_start:batch_end] = location_matrix.cpu()
-                round_score_matrix[batch_start:batch_end] = batch_top_samples.cpu()
-                round_lower_bound[batch_start:batch_end] = sampler.final_lower_bound.cpu()
-                round_upper_bound[batch_start:batch_end] = sampler.final_upper_bound.cpu()
-                round_seed_pick_uids[batch_start:batch_end] = batch_pick_uids
-                round_batch_ids[batch_start:batch_end] = batch_start // outer_batch_size
+                remaining_groups = []
+                finalized_groups = []
+                overlapping_groups = []
+                for group in pending_groups:
+                    if int(group["lookup_end_msec"]) < batch_lookup_start_msec:
+                        finalized_groups.append(group)
+                    elif (
+                        _windows_overlap(
+                            group["lookup_start_msec"],
+                            group["lookup_end_msec"],
+                            batch_lookup_start_msec,
+                            batch_lookup_end_msec,
+                        )
+                        or _has_intersection(group["lookup_ids"], batch_lookup_ids)
+                    ):
+                        overlapping_groups.append(group)
+                    else:
+                        remaining_groups.append(group)
 
-                del batch_phase_index, sampler, batch_top_samples, batch_location_values_gpu
-                if (batch_end // outer_batch_size) % _BATCH_CLEANUP_INTERVAL == 0:
+                for group in finalized_groups:
+                    finalize_pending_group(group)
+
+                if overlapping_groups:
+                    remaining_groups.append(
+                        merge_pending_groups(
+                            overlapping_groups,
+                            pending_item,
+                            batch_lookup_ids,
+                            batch_lookup_start_msec,
+                            batch_lookup_end_msec,
+                        )
+                    )
+                else:
+                    remaining_groups.append(
+                        make_pending_group(
+                            pending_item,
+                            batch_lookup_ids,
+                            batch_lookup_start_msec,
+                            batch_lookup_end_msec,
+                        )
+                    )
+                pending_groups = remaining_groups
+
+                del batch_phase_index, sampler, batch_top_samples, batch_location_values_gpu, batch_local_times
+                if (batch_index + 1) % _BATCH_CLEANUP_INTERVAL == 0:
                     with timed(logger, "batch.cleanup"):
                         if torch.cuda.is_available():
                             with timed(logger, "batch.cleanup.cuda_empty_cache"):
                                 torch.cuda.empty_cache()
                         with timed(logger, "batch.cleanup.gc_collect"):
                             gc.collect()
-
-        round_write_dict = {"logger": logger}
-        get_result_i = 0 if allow_continue else 1
         logger.info(f"Round {round_index}: writing results...")
-        with timed(logger, f"round{round_index}.write_results"):
-            gr = GetResult(
-                get_result_i,
-                cfg["max_distance"],
-                round_initial_location_matrix,
-                round_score_matrix,
-                station_matrix,
-                round_lower_bound,
-                round_upper_bound,
-                round_seed_pick_uids,
-                station_dic,
-                cfg["min_P_tolerance"],
-                cfg["max_P_tolerance"],
-                cfg["min_S_tolerance"],
-                cfg["max_S_tolerance"],
-                current_phase_index,
-                local_p_tt_matrix,
-                local_s_tt_matrix,
-                distance_step_km,
-                depth_step_km,
-                cfg["P_weight"],
-                1 - cfg["P_weight"],
-                0.95,
-                0.05,
-                0,
-                cfg["time_type"],
-                cfg["number_type"],
-                "Continuous",
-                cfg["dis0"],
-                cfg["dis1"],
-                round_write_dict,
-                0,
-                0,
-                0,
-                0,
-                cfg["min_p"],
-                cfg["min_s"],
-                cfg["min_sum"],
-                cfg["min_both"],
-                cfg["only_double"],
-                reference_utc,
-                "",
-                result_batch_size,
-                device=cfg["device"],
-                initial_batch_ids=round_batch_ids,
-            )
-            round_result = gr.write_results()
+        for group in pending_groups:
+            finalize_pending_group(group)
+        pending_groups = []
+
+        if allow_continue and round_events and used_pick_ids_total:
+            remaining_phase_index = current_phase_index.remove_pick_ids(used_pick_ids_total)
+            keep_seed_chunks = []
+            keep_location_chunks = []
+            keep_time_chunks = []
+            if used_pick_mask is not None and successful_batch_ids_total:
+                for record in batch_seed_records:
+                    if int(record["batch_index"]) not in successful_batch_ids_total:
+                        continue
+                    batch_keep_mask = ~used_pick_mask[record["seed_pick_uids"].long()]
+                    if batch_keep_mask.any().item():
+                        keep_seed_chunks.append(record["seed_pick_uids"][batch_keep_mask])
+                        keep_location_chunks.append(record["seed_locations"][batch_keep_mask])
+                        keep_time_chunks.append(record["seed_times"][batch_keep_mask])
+            if keep_seed_chunks:
+                next_seed_pick_uids = torch.cat(keep_seed_chunks, dim=0)
+                next_location_matrix = torch.cat(keep_location_chunks, dim=0)
+                next_seed_times = torch.cat(keep_time_chunks, dim=0)
+                round_result = {
+                    "continue": True,
+                    "events": round_events,
+                    "counts": round_counts,
+                    "location_matrix": next_location_matrix,
+                    "initial_seed_pick_uids": next_seed_pick_uids,
+                    "seed_times": next_seed_times,
+                    "phase_index": remaining_phase_index,
+                }
+            else:
+                round_result = {"continue": False, "events": round_events, "counts": round_counts}
+        else:
+            round_result = {"continue": False, "events": round_events, "counts": round_counts}
 
         for local_index, event in enumerate(round_result["events"], start=1):
             global_event_counter += 1
@@ -952,11 +1162,8 @@ def _associate_pick_dataframe(
             current_seed_df = None
             remaining_location_matrix = round_result["location_matrix"]
             current_seed_pick_uids = round_result["initial_seed_pick_uids"]
-            current_seed_location_values = torch.cat(
-                [remaining_location_matrix[:, :2], remaining_location_matrix[:, 3:4]],
-                dim=1,
-            )
-            current_seed_times = remaining_location_matrix[:, 3].clone()
+            current_seed_location_values = remaining_location_matrix[:, :2]
+            current_seed_times = round_result["seed_times"]
         round_index += 1
 
     with timed(logger, "post.cleanup"):
@@ -1166,7 +1373,10 @@ def run_from_config(config_path: str) -> None:
         for idx in range(1, completed_rounds + 1):
             round_total = get_time(logger, f"round{idx}.total", mode="total")
             round_sample = get_time(logger, f"round{idx}.sample_batches", mode="total")
-            round_write = get_time(logger, f"round{idx}.write_results", mode="total")
+            round_write = (
+                get_time(logger, f"round{idx}.write_results", mode="total")
+                + get_time(logger, f"round{idx}.pending.write_results", mode="total")
+            )
             if round_total > 0:
                 timing_parts.append(
                     f"round{idx}={round_total:.2f}s"

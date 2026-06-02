@@ -7,6 +7,7 @@ import torch
 from .get_tt import station_key_to_filename, step_to_decimals
 
 PICK_TIME_BIN_SECONDS = 1
+PICK_CANONICAL_MSEC_THRESHOLD = 10
 
 
 def _days_before_year(year):
@@ -37,14 +38,55 @@ def time_code_diff_seconds(time_code, reference_code):
     code_i = code.astype(np.int64, copy=False)
     ref_i = ref.astype(np.int64, copy=False)
     day_diff = _day_number(code_i[:, 0], code_i[:, 1]) - _day_number(ref_i[0], ref_i[1])
-    diff_seconds = (
-        day_diff.astype(np.float32) * 86400.0
-        + (code[:, 2] - ref[2]) * 3600.0
-        + (code[:, 3] - ref[3]) * 60.0
-        + (code[:, 4] - ref[4])
-        + (code[:, 5] - ref[5]) * 0.001
-    )
-    return diff_seconds.astype(np.float32, copy=False)
+    msec = (((code_i[:, 2] * 60 + code_i[:, 3]) * 60 + code_i[:, 4]) * 1000 + code_i[:, 5])
+    ref_msec = (((ref_i[2] * 60 + ref_i[3]) * 60 + ref_i[4]) * 1000 + ref_i[5])
+    diff_msec = day_diff * 86_400_000 + msec - ref_msec
+    return diff_msec.astype(np.float64) / 1000.0
+
+
+def time_code_to_global_msec(time_code):
+    code = np.asarray(time_code, dtype=np.float32).astype(np.int64, copy=False)
+    day_number = _day_number(code[:, 0], code[:, 1])
+    msec_of_day = (((code[:, 2] * 60 + code[:, 3]) * 60 + code[:, 4]) * 1000 + code[:, 5])
+    return day_number * 86_400_000 + msec_of_day
+
+
+def assign_canonical_pick_uid(df, threshold_msec=PICK_CANONICAL_MSEC_THRESHOLD):
+    if df.empty:
+        df["pick_uid"] = np.empty(0, dtype=np.int32)
+        return df
+
+    order = np.lexsort((
+        df["GlobalMsec"].to_numpy(dtype=np.int64, copy=False),
+        df["phasetype"].astype(str).to_numpy(),
+        df["id"].to_numpy(dtype=np.int64, copy=False),
+    ))
+    station_values = df["id"].to_numpy(dtype=np.int64, copy=False)[order]
+    phase_values = df["phasetype"].astype(str).to_numpy()[order]
+    time_values = df["GlobalMsec"].to_numpy(dtype=np.int64, copy=False)[order]
+
+    uid_sorted = np.empty(len(df), dtype=np.int32)
+    uid = np.int64(0)
+    group_start_time = time_values[0]
+    uid_sorted[0] = np.int32(uid)
+    for idx in range(1, len(df)):
+        same_pick = (
+            station_values[idx] == station_values[idx - 1]
+            and phase_values[idx] == phase_values[idx - 1]
+            and time_values[idx] - group_start_time < threshold_msec
+        )
+        if not same_pick:
+            uid += 1
+            if uid > np.iinfo(np.int32).max:
+                raise ValueError("Too many canonical picks for int32 pick_uid")
+            group_start_time = time_values[idx]
+        uid_sorted[idx] = np.int32(uid)
+
+    pick_uid = np.empty(len(df), dtype=np.int32)
+    pick_uid[order] = uid_sorted
+    df = df.copy()
+    df["pick_uid"] = pick_uid
+    return df
 
 
 class CsvTorch(object):
@@ -107,8 +149,6 @@ class CsvTorch(object):
 
     def _read_phase_csv(self):
         self.df = self._load_source_df()
-        if "pick_uid" not in self.df.columns:
-            self.df["pick_uid"] = np.arange(len(self.df), dtype=np.int64)
         self.df["Time"] = pd.to_datetime(self.df["Time"], utc=True)
         self.reference_time = self._get_reference_time(self.df)
         time_code = datetime_to_time_code(self.df["Time"])
@@ -119,6 +159,7 @@ class CsvTorch(object):
         self.df["TimeMinute"] = time_code[:, 3]
         self.df["TimeSecond"] = time_code[:, 4]
         self.df["TimeMillisecond"] = time_code[:, 5]
+        self.df["GlobalMsec"] = time_code_to_global_msec(time_code)
         self.df["RelativeTime"] = time_code_diff_seconds(time_code, reference_code)
         self.df["RelativeTime"] = self.df["RelativeTime"].round(self.pick_time_round_decimals)
         self.df["net_sta"] = self.df["network"].astype(str) + "_" + self.df["station"].astype(str)
@@ -242,6 +283,7 @@ class CsvTorch(object):
         )
         self.sta_dict = {row["id"]: row["net_sta"].split("_") for _, row in self.unique_stations.iterrows()}
         self.df = pd.merge(self.df, self.unique_stations[["net_sta", "id"]], on="net_sta", how="left")
+        self.df = assign_canonical_pick_uid(self.df)
         self.num_stations = self.unique_stations["id"].nunique()
         self.max_id = self.station_tensor.shape[0]
         return self.station_tensor, self.num_stations, self.sta_dict
@@ -252,13 +294,13 @@ class CsvTorch(object):
         self.initial_point_df = p_df
         initial_point = torch.tensor(
             p_df[["latitude", "longitude", "RelativeTime"]].values,
-            dtype=torch.float32,
+            dtype=torch.float64,
             device=self.device,
         )
         number = initial_point.shape[0]
-        constant_depth = torch.full((number, 1), 0, device=self.device, dtype=torch.float32)
+        constant_depth = torch.full((number, 1), 0, device=self.device, dtype=torch.float64)
         initial_point = torch.hstack((initial_point[:, :2], constant_depth, initial_point[:, 2:]))
-        zero_matrix = torch.zeros((initial_point.shape[0], 1), dtype=torch.float32, device=self.device)
+        zero_matrix = torch.zeros((initial_point.shape[0], 1), dtype=torch.float64, device=self.device)
         score_matrix = torch.hstack((initial_point, zero_matrix))
         return initial_point, score_matrix
 
@@ -271,14 +313,11 @@ class CsvTorch(object):
         df_subset = df_subset.copy()
         df_subset["RelativeTime_Bin"] = (df_subset["RelativeTime"] // PICK_TIME_BIN_SECONDS).astype(int)
 
-        values = df_subset[["id", "RelativeTime_Bin", "RelativeTime", "Probability", "Amplitude"]].to_numpy()
-        tensor_data = torch.tensor(values, dtype=torch.float32, device=self.device)
-
-        ids = tensor_data[:, 0].to(torch.long)
-        bins = tensor_data[:, 1].to(torch.long)
-        rel_time = tensor_data[:, 2]
-        prob = tensor_data[:, 3]
-        amp = tensor_data[:, 4]
+        ids = torch.tensor(df_subset["id"].to_numpy(), dtype=torch.long, device=self.device)
+        bins = torch.tensor(df_subset["RelativeTime_Bin"].to_numpy(), dtype=torch.long, device=self.device)
+        rel_time = torch.tensor(df_subset["RelativeTime"].to_numpy(), dtype=torch.float64, device=self.device)
+        prob = torch.tensor(df_subset["Probability"].to_numpy(), dtype=torch.float64, device=self.device)
+        amp = torch.tensor(df_subset["Amplitude"].to_numpy(), dtype=torch.float64, device=self.device)
 
         df_subset["group_key"] = list(zip(ids.cpu().tolist(), bins.cpu().tolist()))
         group_counts = df_subset["group_key"].value_counts()
@@ -289,7 +328,7 @@ class CsvTorch(object):
         result = torch.full(
             (max_rows, self.max_id, time_bins, 3),
             float("nan"),
-            dtype=torch.float32,
+            dtype=torch.float64,
             device=self.device,
         )
 
@@ -322,7 +361,7 @@ class CsvTorch(object):
         S_tensor = self.generate_phase_tensor(df_S) if len(df_S) > 0 else torch.full(
             (1, self.max_id, P_tensor.shape[2], 3),
             float("nan"),
-            dtype=torch.float32,
+            dtype=torch.float64,
             device=self.device,
         )
         return P_tensor, S_tensor, len(df_P), len(df_S)

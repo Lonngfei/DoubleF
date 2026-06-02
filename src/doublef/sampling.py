@@ -23,7 +23,7 @@ class Sampler(object):
                  phase_index, p_tt_matrix, s_tt_matrix, tt_distance_step_km, tt_depth_step_km,
                  P_weight, S_weight, magnitude_weight, time_type, number_type, magnitude_type, dis0, dis1, lat_max, lon_max, dep_max, time_max,
                  sample_index, top_number_index, number_weight_index, time_weight_index, confidence_level_index,
-                 sampling_batch_size=32, score_event_batch_size=64, device='cuda'):
+                 sampling_batch_size=32, score_event_batch_size=64, device='cuda', only_double=False):
         self.device = device
         self.logger = logger
         self.max_distance = max_distance
@@ -57,6 +57,7 @@ class Sampler(object):
         self.confidence_level_index = confidence_level_index
         self.sampling_batch_size = sampling_batch_size
         self.score_event_batch_size = score_event_batch_size
+        self.only_double = bool(only_double)
         self.sobol_backend = "sobol_seq" if _sobol_seq_module is not None else "torch"
         self._sobol_engine = SobolEngine(dimension=4, scramble=False) if self.sobol_backend == "torch" else None
 
@@ -135,6 +136,7 @@ class Sampler(object):
             self.score_event_batch_size,
             self.device,
             logger=self.logger,
+            only_double=self.only_double,
         )
 
         with timed(self.logger, "sampling.batch_score"):
