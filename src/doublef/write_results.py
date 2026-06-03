@@ -169,11 +169,12 @@ class GetResult:
     def write_results(self):
         logger = self.write_dict.get("logger")
         with timed(logger, "result.sort_candidates"):
-            sorted_score_indices = torch.argsort(self.input_score.squeeze(-1), descending=True)
+            score_values = self.input_score.reshape(-1)
+            sorted_score_indices = torch.argsort(score_values, descending=True)
             sorted_location_matrix = self.location_matrix[sorted_score_indices]
             sorted_lower_bound = self.final_lower_bound[sorted_score_indices]
             sorted_upper_bound = self.final_upper_bound[sorted_score_indices]
-            sorted_scores = self.input_score.squeeze(-1)[sorted_score_indices]
+            sorted_scores = score_values[sorted_score_indices]
             sorted_seed_pick_uids = self.initial_seed_pick_uids[sorted_score_indices]
             sorted_batch_ids = (
                 self.initial_batch_ids[sorted_score_indices]
